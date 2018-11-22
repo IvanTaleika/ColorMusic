@@ -600,6 +600,36 @@ float calcSoundLevel(float level) {
   return level;
 }
 
+void checkBluetooth() {
+  if (bluetoothSerial.available() > 0) {
+    readBluetooth();
+  }
+  if (isMessageReceived) {
+    processMessage();
+  }
+}
+
+void readBluetooth() {
+  char incomingByte = bluetoothSerial.read();
+  if (isReceiving) {
+    if (incomingByte == END_BYTE) {
+      isReceiving = false;
+      isMessageReceived = true;
+    } else {
+      bluetoothMessage += incomingByte;
+    }
+  }
+  if (incomingByte == START_BYTE) {
+    isReceiving = true;
+    bluetoothMessage = "";
+  }
+}
+
+void processMessage() {
+  currentMode = bluetoothMessage.toInt();
+  isMessageReceived = false;
+}
+
 void HIGHS() {
   for (int i = 0; i < NUM_LEDS; i++) leds[i] = CHSV(HIGH_COLOR, 255, thisBright[2]);
 }
