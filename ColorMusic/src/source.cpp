@@ -28,162 +28,8 @@
 // Serial.println();
 #define FHT_N 64   // ширина спектра х2
 #define LOG_OUT 1  // FOR FHT.h lib
-#include <EEPROMex.h>
+#include "source.h"
 #include <FHT.h>  // преобразование Хартли
-#include <SoftwareSerial.h>
-#define FASTLED_ALLOW_INTERRUPTS 1
-#include "FastLED.h"
-
-// пины
-#define SOUND_R A2  // аналоговый пин вход аудио, правый канал
-#define SOUND_L A1  // аналоговый пин вход аудио, левый канал
-// аналоговый пин вход аудио для режима с частотами (через кондер)
-#define SOUND_R_FREQ A3
-#define MLED_PIN 13  // пин светодиода режимов
-#define LED_PIN 4    // пин DI светодиодной ленты
-// 1 - используем потенциометр, 0 - используется внутренний источник
-// опорного напряжения 1.1 В
-#define POTENT 0
-#define POT_GND A0  // пин земля для потенциометра
-
-SoftwareSerial bluetoothSerial(4, 3);  // RX | TX
-#define START_BYTE '$'
-#define END_BYTE '^'
-
-#define averK 0.006
-#define LOOP_DELAY 5  // период основного цикла отрисовки (по умолчанию 5)
-
-#define cbi(sfr, bit) (_SFR_BYTE(sfr) &= ~_BV(bit))
-#define sbi(sfr, bit) (_SFR_BYTE(sfr) |= _BV(bit))
-
-void analyzeAudio();
-
-struct Global {
-  bool isOn = true;
-  bool isMicro = false;
-  // 1 - только один канал (ПРАВЫЙ!!!!! SOUND_R!!!!!), 0 - два канала
-  bool isMono = true;
-  uint8_t enabledBrightness = 200;
-  uint8_t disabledBrightness = 30;
-  uint8_t currentMode = 0;
-  // степень усиления сигнала (для более "резкой" работы)
-  float expCoeffincient = 1;
-  uint8_t disabledColor = HUE_PURPLE;
-
-  uint16_t numLeds = 100;
-  uint16_t halfLedsNum;
-};
-
-struct Backlight {
-  uint8_t mode = 0;
-  uint8_t defaultHue = 150;
-  // mode 1
-  uint8_t defaultSaturation = 200;
-
-  // mode 2
-  uint8_t colorChangeDelay = 100;
-  unsigned long colorChangeTime;
-  uint8_t currentColor;
-
-  // mode 3
-  uint8_t rainbowColorChangeStep = 3;
-  uint8_t rainbowStep = 5;
-};
-
-// режим стробоскопа
-struct Strobe {
-  unsigned long previousFlashTime;
-  uint8_t hue = HUE_YELLOW;
-  uint8_t saturation = 0;
-  uint8_t bright = 0;
-  uint8_t brightStep = 100;
-  uint8_t duty = 20;
-  uint16_t cycleDelay = 100;  // период вспышек, миллисекунды
-};
-
-struct VuAnalyzer {
-  // коэффициент перевода для палитры
-  float colorToLed;
-  uint16_t signalThreshold = 15;
-  float averageLevel = 50;
-  float maxLevel = 100;
-  static const float maxMultiplier = 1.8;
-  uint8_t rainbowStep = 5;
-  float smooth = 0.3;
-  bool isRainbowOn = false;
-  uint8_t rainbowColor = 0;
-  unsigned long rainbowTimer;
-
-  float rAverage = 0;
-  float lAverage = 0;
-
-  static const uint8_t additionalThreshold = 13;
-  void setAutoThreshold() {
-    int maxLevel = 0;  // максимум
-    int level;
-    for (uint8_t i = 0; i < 200; i++) {
-      level = analogRead(SOUND_R);  // делаем 200 измерений
-      if (level > maxLevel && level < 150) {  // ищем максимумы
-        maxLevel = level;                     // запоминаем
-      }
-      delay(4);  // ждём 4мс
-    }
-    // нижний порог как максимум тишины  некая величина
-    signalThreshold = maxLevel + additionalThreshold;
-  }
-};
-
-struct FrequencyAnalyzer {
-  uint16_t signalThreshold = 40;
-  bool isFullTransform = false;
-  struct LowMediumHighTransform {
-    uint8_t colors[3] = {HUE_RED, HUE_GREEN, HUE_YELLOW};
-
-    float smooth = 0.8;
-    float flashMultiplier = 1.2;
-    uint8_t bright[3];
-    float averageFrequency[3];
-    bool isFlash[3];
-    static const uint8_t step = 20;
-    uint8_t mode;
-    struct RunningFrequency {
-      uint8_t speed = 10;
-      unsigned long runDelay;
-      int8_t mode = 0;
-    } runningFrequency;
-    struct OneLine {
-      uint8_t mode;
-    } oneLine;
-  } lmhTransform;
-
-  struct FullTransform {
-    uint8_t smooth = 2;
-    uint8_t lowFrequencyHue = HUE_RED;
-    uint8_t hueStep = 5;
-
-    float ledsForFreq;
-    float maxFrequency = 0;
-    uint8_t frequency[30];
-  } fullTransform;
-
-  static const uint8_t additionalThreshold = 3;
-  void setAutoThreshold() {
-    int maxLevel = 0;  // максимум
-    int level;
-    for (uint8_t i = 0; i < 100; i++) {  // делаем 100 измерений
-      analyzeAudio();                    // разбить в спектр
-      for (uint8_t j = 2; j < 32; j++) {  // первые 2 канала - хлам
-        level = fht_log_out[j];
-        if (level > maxLevel) {  // ищем максимумы
-          maxLevel = level;      // запоминаем
-        }
-      }
-      delay(4);  // ждём 4мс
-    }
-    // нижний порог как максимум тишины некая величина
-    signalThreshold = maxLevel + additionalThreshold;
-  }
-};
 
 // градиент-палитра от зелёного к красному
 DEFINE_GRADIENT_PALETTE(soundlevel_gp){
@@ -193,7 +39,7 @@ DEFINE_GRADIENT_PALETTE(soundlevel_gp){
     200, 255, 50,  0,  // red
     255, 255, 0,   0   // red
 };
-
+SoftwareSerial BLUETOOTH_SERIAL(2, 3);  // arduino RX | TX
 CRGBPalette32 MY_PAL = soundlevel_gp;
 unsigned long LOOP_TIMER = 0;
 CRGB* STRIP_LEDS = nullptr;
@@ -202,9 +48,11 @@ VuAnalyzer VU;
 FrequencyAnalyzer FREQUENCY;
 Strobe STROBE;
 Backlight BACKLIGHT;
+Bluetooth BLUETOOTH;
 
 void setup() {
   Serial.begin(9600);
+  BLUETOOTH_SERIAL.begin(9600);
   pinMode(MLED_PIN, OUTPUT);  //Режим пина для светодиода режима на выход
   digitalWrite(MLED_PIN, LOW);  //Выключение светодиода режима
   pinMode(POT_GND, OUTPUT);
@@ -230,14 +78,54 @@ void initLeds() {
   FastLED.setBrightness(GLOBAL.enabledBrightness);
   GLOBAL.halfLedsNum = GLOBAL.numLeds / 2;
   VU.colorToLed = (float)255 / GLOBAL.halfLedsNum;
-
-  FREQUENCY.fullTransform.ledsForFreq = GLOBAL.halfLedsNum / 30;
+  FREQUENCY.fullTransform.ledsForFreq = (float)GLOBAL.halfLedsNum / 30;
+  Serial.print("GLOBAL.halfLedsNum=");
+  Serial.println(GLOBAL.halfLedsNum);
+  Serial.print("VU.colorToLed=");
+  Serial.println(VU.colorToLed);
+  Serial.print("FREQUENCY.fullTransform.ledsForFreq=");
+  Serial.println(FREQUENCY.fullTransform.ledsForFreq);
 }
 
 void setThreshold() {
   delay(1000);  // ждём инициализации АЦП
-  VU.setAutoThreshold();
-  FREQUENCY.setAutoThreshold();
+  setVuThreshold();
+  setFrequencyThreshold();
+}
+
+void setVuThreshold() {
+  Serial.println("VU signalThreshold");
+
+  int maxLevel = 0;  // максимум
+  int level;
+  for (uint8_t i = 0; i < 200; i++) {
+    level = analogRead(SOUND_R);  // делаем 200 измерений
+    if (level > maxLevel && level < 150) {  // ищем максимумы
+      maxLevel = level;                     // запоминаем
+    }
+    delay(4);  // ждём 4мс
+  }
+  // нижний порог как максимум тишины  некая величина
+  VU.signalThreshold = maxLevel + VU.additionalThreshold;
+}
+
+void setFrequencyThreshold() {
+  Serial.println("setFrequencyThreshold");
+
+  int maxLevel = 0;  // максимум
+  int level;
+  for (uint8_t i = 0; i < 100; i++) {   // делаем 100 измерений
+    analyzeAudio();                     // разбить в спектр
+    for (uint8_t j = 2; j < 32; j++) {  // первые 2 канала - хлам
+      level = fht_log_out[j];
+      if (level > maxLevel) {  // ищем максимумы
+        maxLevel = level;      // запоминаем
+      }
+    }
+    delay(4);  // ждём 4мс
+  }
+  // нижний порог как максимум тишины некая величина
+  FREQUENCY.signalThreshold = maxLevel + FREQUENCY.additionalThreshold;
 }
 
 void loop() {
@@ -278,7 +166,7 @@ void processLevel() {
     if (rMax < rLevel) {
       rMax = rLevel;
     }
-    if (!GLOBAL.isMono && !GLOBAL.isMicro) {
+    if (GLOBAL.isStereo && !GLOBAL.isMicro) {
       lLevel = analogRead(SOUND_L);
       if (lMax < lLevel) {
         lMax = lLevel;
@@ -288,7 +176,7 @@ void processLevel() {
   // фильтр скользящее среднее
   VU.rAverage = (float)rMax * VU.smooth + VU.rAverage * (1 - VU.smooth);
 
-  if (!GLOBAL.isMono && !GLOBAL.isMicro) {
+  if (GLOBAL.isStereo && !GLOBAL.isMicro) {
     lMax = calcSoundLevel(lMax);
     VU.lAverage = (float)lMax * VU.smooth + VU.lAverage * (1 - VU.smooth);
   } else {
@@ -391,7 +279,6 @@ void backlightAnimation() {
       break;
   }
 }
-// DONE!
 void processStrobe() {
   unsigned long delay = millis() - STROBE.previousFlashTime;
   if (delay > STROBE.cycleDelay) {
@@ -409,7 +296,6 @@ void processStrobe() {
   }
   strobeAnimation();
 }
-// DONE!
 void strobeAnimation() {
   if (STROBE.bright > 0) {
     fillLeds(CHSV(STROBE.hue, STROBE.saturation, STROBE.bright));
@@ -646,32 +532,133 @@ void silence() {
 
 void fillLeds(CHSV color) { fill_solid(STRIP_LEDS, GLOBAL.numLeds, color); }
 
-bool isReceiving;
-bool isMessageReceived;
-String bluetoothMessage;
 void checkBluetooth() {
-  if (bluetoothSerial.available() > 0) {
+  if (BLUETOOTH_SERIAL.available()) {
     readBluetooth();
   }
-  if (isMessageReceived) {
+  if (BLUETOOTH.isMessageReceived) {
     processMessage();
   }
 }
 
 void readBluetooth() {
-  char incomingByte = bluetoothSerial.read();
-  if (isReceiving) {
+  char incomingByte = BLUETOOTH_SERIAL.read();
+  Serial.print("readBluetooth=");
+  Serial.println(incomingByte);
+  if (BLUETOOTH.isReceiving) {
     if (incomingByte == END_BYTE) {
-      isReceiving = false;
-      isMessageReceived = true;
+      BLUETOOTH.isReceiving = false;
+      BLUETOOTH.isMessageReceived = true;
     } else {
-      bluetoothMessage += incomingByte;
+      BLUETOOTH.message += incomingByte;
     }
   }
   if (incomingByte == START_BYTE) {
-    isReceiving = true;
-    bluetoothMessage = "";
+    BLUETOOTH.isReceiving = true;
+    BLUETOOTH.message = "";
   }
 }
 
-void processMessage() { isMessageReceived = false; }
+void processMessage() {
+  Serial.print("message=");
+  Serial.println(BLUETOOTH.message);
+  Serial.print("state=");
+  Serial.println(BLUETOOTH.state);
+  uint8_t destination = BLUETOOTH.message.substring(0, 1).toInt();
+
+  uint8_t result = 0;
+  switch (destination) {
+    case 0:
+      result = globalUpdate(BLUETOOTH.message);
+      break;
+    case 1:
+      result = vuUpdate(BLUETOOTH.message);
+      break;
+    case 2:
+      result = frequencyUpdate(BLUETOOTH.message);
+      break;
+    case 3:
+      result = strobeUpdate(BLUETOOTH.message);
+      break;
+    case 4:
+      result = backlightUpdate(BLUETOOTH.message);
+      break;
+    case 9:
+      bluetoothOperation(BLUETOOTH.message);
+      break;
+    default:
+      result = 1;
+      break;
+  }
+  if (result) {
+    BLUETOOTH.state = result;
+  }
+  BLUETOOTH.isMessageReceived = false;
+}
+
+uint8_t globalUpdate(String& message) {
+  auto setting = static_cast<Global::Setting>(message.substring(1, 3).toInt());
+  switch (setting) {
+    case Global::ON_OFF:
+      GLOBAL.isOn = message.substring(3).toInt();
+      Serial.print("GLOBAL.isOn=");
+      Serial.println(GLOBAL.isOn);
+      return 0;
+    case Global::MICRO:
+      GLOBAL.isMicro = message.substring(3).toInt();
+      setThreshold();
+      Serial.print("GLOBAL.isMicro=");
+      Serial.println(GLOBAL.isMicro);
+      return 0;
+    case Global::STEREO:
+      GLOBAL.isStereo = message.substring(3).toInt();
+      Serial.print("GLOBAL.isStereo=");
+      Serial.println(GLOBAL.isStereo);
+      return 0;
+    case Global::MODE:
+      GLOBAL.currentMode = message.substring(3).toInt();
+      Serial.print("GLOBAL.currentMode=");
+      Serial.println(GLOBAL.currentMode);
+      return 0;
+    case Global::N_LEDS:
+      GLOBAL.numLeds = message.substring(3).toInt();
+      initLeds();
+      Serial.print("GLOBAL.numLeds=");
+      Serial.println(GLOBAL.numLeds);
+      return 0;
+    case Global::ENABLED_BRIGHTNESS:
+      GLOBAL.enabledBrightness = message.substring(3).toInt();
+      Serial.print("GLOBAL.enabledBrightness=");
+      Serial.println(GLOBAL.enabledBrightness);
+      return 0;
+    case Global::DISABLED_BRIGHTNESS:
+      GLOBAL.disabledBrightness = message.substring(3).toInt();
+      Serial.print("GLOBAL.disabledBrightness=");
+      Serial.println(GLOBAL.disabledBrightness);
+      return 0;
+    default:
+      return 2;
+  }
+}
+
+uint8_t vuUpdate(String& message) { return 3; }
+uint8_t frequencyUpdate(String& message) { return 4; }
+uint8_t strobeUpdate(String& message) { return 5; }
+uint8_t backlightUpdate(String& message) { return 6; }
+void bluetoothOperation(String& message) {
+  auto operation =
+      static_cast<Bluetooth::Operation>(message.substring(1, 3).toInt());
+  switch (operation) {
+    case Bluetooth::GET_STATE:
+      BLUETOOTH_SERIAL.write(BLUETOOTH.state);
+      Serial.print("BLUETOOTH.state=");
+      Serial.println(BLUETOOTH.state);
+      return;
+    case Bluetooth::RESET_STATE:
+      Serial.print("RESET BLUETOOTH.state=");
+      Serial.println(BLUETOOTH.state);
+      BLUETOOTH.state = 0;
+      return;
+      
+  }
+}
