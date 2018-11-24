@@ -24,6 +24,8 @@
 */
 
 // --------------------------- НАСТРОЙКИ ---------------------------
+// Serial.print("");
+// Serial.println();
 #define FHT_N 64   // ширина спектра х2
 #define LOG_OUT 1  // FOR FHT.h lib
 #include <EEPROMex.h>
@@ -38,15 +40,23 @@
 // аналоговый пин вход аудио для режима с частотами (через кондер)
 #define SOUND_R_FREQ A3
 #define MLED_PIN 13  // пин светодиода режимов
-#define MLED_ON HIGH
-#define LED_PIN 4   // пин DI светодиодной ленты
+#define LED_PIN 4    // пин DI светодиодной ленты
+// 1 - используем потенциометр, 0 - используется внутренний источник
+// опорного напряжения 1.1 В
+#define POTENT 0
 #define POT_GND A0  // пин земля для потенциометра
 
 SoftwareSerial bluetoothSerial(4, 3);  // RX | TX
 #define START_BYTE '$'
 #define END_BYTE '^'
-// лента
-#define NUM_LEDS 102  // количество светодиодов  //В приложении
+
+#define averK 0.006
+#define LOOP_DELAY 5  // период основного цикла отрисовки (по умолчанию 5)
+
+#define cbi(sfr, bit) (_SFR_BYTE(sfr) &= ~_BV(bit))
+#define sbi(sfr, bit) (_SFR_BYTE(sfr) |= _BV(bit))
+
+void analyzeAudio();
 
 struct Global {
   bool isOn = true;
@@ -59,14 +69,14 @@ struct Global {
   // степень усиления сигнала (для более "резкой" работы)
   float expCoeffincient = 1;
   uint8_t disabledColor = HUE_PURPLE;
-  // NOT setted
+
   uint16_t numLeds = 100;
-  uint16_t halfLedsNum = numLeds / 2;
-} GLOBAL;
+  uint16_t halfLedsNum;
+};
 
 struct Backlight {
   uint8_t mode = 0;
-  uint8_t defaultColor = 150;
+  uint8_t defaultHue = 150;
   // mode 1
   uint8_t defaultSaturation = 200;
 
@@ -78,31 +88,34 @@ struct Backlight {
   // mode 3
   uint8_t rainbowColorChangeStep = 3;
   uint8_t rainbowStep = 5;
-} BACKLIGHT;
+};
 
 // режим стробоскопа
 struct Strobe {
   unsigned long previousFlashTime;
-  uint8_t color = HUE_YELLOW;
+  uint8_t hue = HUE_YELLOW;
   uint8_t saturation = 0;
   uint8_t bright = 0;
   uint8_t brightStep = 100;
   uint8_t duty = 20;
   uint16_t cycleDelay = 100;  // период вспышек, миллисекунды
-} STROBE;
+};
 
 struct VuAnalyzer {
   // коэффициент перевода для палитры
   float colorToLed;
   uint16_t signalThreshold = 15;
-  uint16_t averageSoundLevel = 50;
-  uint16_t maxSoundLevel = 100;
-
+  float averageLevel = 50;
+  float maxLevel = 100;
+  static const float maxMultiplier = 1.8;
   uint8_t rainbowStep = 5;
   float smooth = 0.3;
   bool isRainbowOn = false;
   uint8_t rainbowColor = 0;
   unsigned long rainbowTimer;
+
+  float rAverage = 0;
+  float lAverage = 0;
 
   static const uint8_t additionalThreshold = 13;
   void setAutoThreshold() {
@@ -110,41 +123,47 @@ struct VuAnalyzer {
     int level;
     for (uint8_t i = 0; i < 200; i++) {
       level = analogRead(SOUND_R);  // делаем 200 измерений
-      if (level > maxLevel) {       // ищем максимумы
-        maxLevel = level;           // запоминаем
+      if (level > maxLevel &&
+          (!GLOBAL.isMicro && level < 150)) {  // ищем максимумы
+        maxLevel = level;                      // запоминаем
       }
       delay(4);  // ждём 4мс
     }
     // нижний порог как максимум тишины  некая величина
     signalThreshold = maxLevel + additionalThreshold;
   }
-} VU;
+};
 
-void analyzeAudio() {
-  for (int i = 0; i < FHT_N; i++) {
-    fht_input[i] = analogRead(SOUND_R_FREQ);  // put real data into bins
-  }
-  fht_window();   // window the data for better frequency response
-  fht_reorder();  // reorder the data before doing the fht
-  fht_run();      // process the data in the fht
-  fht_mag_log();  // take the output of the fht
-}
 struct FrequencyAnalyzer {
   uint16_t signalThreshold = 40;
-  uint8_t mode;
-  struct RunningFrequency {
-    uint8_t speed = 10;
-    unsigned long runDelay;
-    int8_t mode;
-  } runningFrequency;
+  bool isFullTransform = false;
+  struct LowMediumHighTransform {
+    uint8_t colors[3] = {HUE_RED, HUE_GREEN, HUE_YELLOW};
+
+    float smooth = 0.8;
+    float flashMultiplier = 1.2;
+    uint8_t bright[3];
+    float averageFrequency[3];
+    bool isFlash[3];
+    static const uint8_t step = 20;
+    uint8_t mode;
+    struct RunningFrequency {
+      uint8_t speed = 10;
+      unsigned long runDelay;
+      int8_t mode = 0;
+    } runningFrequency;
+    struct OneLine {
+      uint8_t mode;
+    } oneLine;
+  } lmhTransform;
 
   struct FullTransform {
-    uint8_t smooth;
+    uint8_t smooth = 2;
     uint8_t lowFrequencyHue = HUE_RED;
     uint8_t hueStep = 5;
 
     float ledsForFreq;
-    float maxFrequency;
+    float maxFrequency = 0;
     uint8_t frequency[30];
   } fullTransform;
 
@@ -165,38 +184,8 @@ struct FrequencyAnalyzer {
     // нижний порог как максимум тишины некая величина
     signalThreshold = maxLevel + additionalThreshold;
   }
-} FREQUENCY;
+};
 
-// отрисовка
-#define MODE 1       // режим при запуске
-#define MAIN_LOOP 5  // период основного цикла отрисовки (по умолчанию 5)
-unsigned long main_timer;
-// 1 - используем потенциометр, 0 - используется внутренний источник
-// опорного напряжения 1.1 В
-#define POTENT 0
-// разрешить настройку нижнего порога шумов при запуске (по умолч. 0)
-#define AUTO_LOW_PASS 0
-// шкала громкости
-// коэффициент громкости (максимальное равно срднему * этот коэф) (по
-// умолчанию 1.8)
-#define MAX_COEF 1.8
-
-// режим цветомузыки
-// коэффициент плавности анимации частот (по умолчанию 0.8)
-float SMOOTH_FREQ = 0.8;
-// коэффициент порога для "вспышки" цветомузыки (по умолчанию 1.5)
-float MAX_COEF_FREQ = 1.2;
-// шаг уменьшения яркости в режиме цветомузыки (чем больше, тем быстрее
-// гаснет)
-#define SMOOTH_STEP 20
-#define LOW_COLOR HUE_RED      // цвет низких частот
-#define MID_COLOR HUE_GREEN    // цвет средних
-#define HIGH_COLOR HUE_YELLOW  // цвет высоких
-
-// ------------------------------ ДЛЯ РАЗРАБОТЧИКОВ
-// --------------------------------
-
-CRGB leds[NUM_LEDS];  // GLOBAL
 // градиент-палитра от зелёного к красному
 DEFINE_GRADIENT_PALETTE(soundlevel_gp){
     0,   0,   255, 0,  // green
@@ -205,231 +194,134 @@ DEFINE_GRADIENT_PALETTE(soundlevel_gp){
     200, 255, 50,  0,  // red
     255, 255, 0,   0   // red
 };
-CRGBPalette32 myPal = soundlevel_gp;
 
-uint8_t Rlenght, Llenght;
-float RsoundLevel, RsoundLevel_f;
-float LsoundLevel, LsoundLevel_f;
-
-float averK = 0.006;  // GLOBAL
-
-int RcurrentLevel, LcurrentLevel;
-int frequency[3];
-float colorMusic_f[3], colorMusic_aver[3];
-bool colorMusicFlash[3];
-int thisBright[3];
-
-bool running_flag[3];
-
-#define cbi(sfr, bit) (_SFR_BYTE(sfr) &= ~_BV(bit))
-#define sbi(sfr, bit) (_SFR_BYTE(sfr) |= _BV(bit))
-// ------------------------------ ДЛЯ РАЗРАБОТЧИКОВ
-// --------------------------------
+CRGBPalette32 MY_PAL = soundlevel_gp;
+unsigned long LOOP_TIMER = 0;
+CRGB* STRIP_LEDS = nullptr;
+Global GLOBAL;
+VuAnalyzer VU;
+FrequencyAnalyzer FREQUENCY;
+Strobe STROBE;
+Backlight BACKLIGHT;
 
 void setup() {
   Serial.begin(9600);
-
   pinMode(MLED_PIN, OUTPUT);  //Режим пина для светодиода режима на выход
-  digitalWrite(MLED_PIN, !MLED_ON);  //Выключение светодиода режима
-
+  digitalWrite(MLED_PIN, LOW);  //Выключение светодиода режима
   pinMode(POT_GND, OUTPUT);
   digitalWrite(POT_GND, LOW);
-
-  initLeds();
-
-  // TODO for wire
-
   if (POTENT) {
     analogReference(EXTERNAL);
   } else {
     analogReference(INTERNAL);
   }
-
   sbi(ADCSRA, ADPS2);
   cbi(ADCSRA, ADPS1);
   sbi(ADCSRA, ADPS0);
 
-  if (AUTO_LOW_PASS) {  // если разрешена автонастройка нижнего порога шумов
-    setThreshold();
-  }
+  initLeds();
+  setThreshold();
 }
+
+void initLeds() {
+  delete[] STRIP_LEDS;
+  STRIP_LEDS = new CRGB[GLOBAL.numLeds];
+  FastLED.addLeds<WS2811, LED_PIN, GRB>(STRIP_LEDS, GLOBAL.numLeds)
+      .setCorrection(TypicalLEDStrip);
+  FastLED.setBrightness(GLOBAL.enabledBrightness);
+  GLOBAL.halfLedsNum = GLOBAL.numLeds / 2;
+  VU.colorToLed = (float)255 / GLOBAL.halfLedsNum;
+
+  FREQUENCY.fullTransform.ledsForFreq = GLOBAL.halfLedsNum / 30;
+}
+
+void setThreshold() {
+  delay(1000);  // ждём инициализации АЦП
+  VU.setAutoThreshold();
+  FREQUENCY.setAutoThreshold();
+}
+
 void loop() {
   checkBluetooth();
-  if (GLOBAL.isOn && millis() - main_timer > MAIN_LOOP) {
+  if (GLOBAL.isOn && millis() - LOOP_TIMER > LOOP_DELAY) {
     processSound();
     FastLED.show();
     if (GLOBAL.currentMode != 7) {  // 7 режиму не нужна очистка!!!
       FastLED.clear();  // очистить массив пикселей
     }
-    main_timer = millis();  // сбросить таймер
+    LOOP_TIMER = millis();  // сбросить таймер
   }
 }
 
-void initLeds() {
-  // TODO: 2811?
-  FastLED.addLeds<WS2812B, LED_PIN, GRB>(leds, NUM_LEDS)
-      .setCorrection(TypicalLEDStrip);
-  FastLED.setBrightness(GLOBAL.enabledBrightness);
-  GLOBAL.halfLedsNum = GLOBAL.numLeds / 2;
-  VU.colorToLed = (float)255 / GLOBAL.halfLedsNum;
-  FREQUENCY.fullTransform.ledsForFreq = GLOBAL.halfLedsNum / 30;
-}
-
 void processSound() {
-  // сбрасываем значения
-  RsoundLevel = 0;
-  LsoundLevel = 0;
   switch (GLOBAL.currentMode) {
     case 0:
       processLevel();
+      return;
     case 1:
       processFrequency();
+      return;
     case 2:
       processStrobe();
+      return;
     case 3:
       backlightAnimation();
+      return;
   }
 }
 
 void processLevel() {
-  for (uint8_t i = 0; i < 100; i++) {     // делаем 100 измерений
-    RcurrentLevel = analogRead(SOUND_R);  // с правого
-    if (RsoundLevel < RcurrentLevel) {
-      RsoundLevel = RcurrentLevel;  // ищем максимальное
+  uint16_t rMax = 0, lMax = 0;
+  uint16_t rLevel, lLevel;
+
+  for (uint8_t i = 0; i < 100; i++) {
+    rLevel = analogRead(SOUND_R);
+    if (rMax < rLevel) {
+      rMax = rLevel;
     }
-    if (!GLOBAL.isMono || !GLOBAL.isMicro) {
-      LcurrentLevel = analogRead(SOUND_L);  // c левого канала
-      if (LsoundLevel < LcurrentLevel) {
-        LsoundLevel = LcurrentLevel;  // ищем максимальное
+    if (!GLOBAL.isMono && !GLOBAL.isMicro) {
+      lLevel = analogRead(SOUND_L);
+      if (lMax < lLevel) {
+        lMax = lLevel;
       }
     }
   }
-  RsoundLevel = calcSoundLevel(RsoundLevel);
   // фильтр скользящее среднее
-  RsoundLevel_f = RsoundLevel * VU.smooth + RsoundLevel_f * (1 - VU.smooth);
-  // For stereo
-  if (!GLOBAL.isMono || !GLOBAL.isMicro) {
-    LsoundLevel = calcSoundLevel(LsoundLevel);
-    LsoundLevel_f = LsoundLevel * VU.smooth + LsoundLevel_f * (1 - VU.smooth);
+  VU.rAverage = (float)rMax * VU.smooth + VU.rAverage * (1 - VU.smooth);
+
+  if (!GLOBAL.isMono && !GLOBAL.isMicro) {
+    lMax = calcSoundLevel(lMax);
+    VU.lAverage = (float)lMax * VU.smooth + VU.lAverage * (1 - VU.smooth);
   } else {
-    LsoundLevel_f = RsoundLevel_f;  // если моно, то левый = правому
+    VU.lAverage = VU.rAverage;
   }
-  // если значение выше порога - начинаем самое интересное
-  // TODO WTF is 15?
-  if (RsoundLevel_f > 15 && LsoundLevel_f > 15) {
+
+  if (VU.rAverage > VU.signalThreshold && VU.lAverage > VU.signalThreshold) {
     // расчёт общей средней громкости с обоих каналов, фильтрация.
     // Фильтр очень медленный, сделано специально для автогромкости
-    VU.averageSoundLevel = (float)(RsoundLevel_f + LsoundLevel_f) / 2 * averK +
-                           VU.averageSoundLevel * (1 - averK);
+    VU.averageLevel = (float)(VU.rAverage + VU.lAverage) / 2. * averK +
+                      VU.averageLevel * (1 - averK);
     // принимаем максимальную громкость шкалы как среднюю, умноженную на
-    // некоторый коэффициент MAX_COEF
-    VU.maxSoundLevel = VU.averageSoundLevel * MAX_COEF;
-    // преобразуем сигнал в длину ленты (где GLOBAL.halfLedsNum это половина
-    // количества светодиодов)
-    Rlenght = map(RsoundLevel_f, 0, VU.maxSoundLevel, 0, GLOBAL.halfLedsNum);
-    Llenght = map(LsoundLevel_f, 0, VU.maxSoundLevel, 0, GLOBAL.halfLedsNum);
+    // некоторый коэффициент maxMultiplier
+    VU.maxLevel = VU.averageLevel * VU.maxMultiplier;
+
+    // преобразуем сигнал в длину ленты
+    int16_t rLength = map(VU.rAverage, 0, VU.maxLevel, 0, GLOBAL.halfLedsNum);
+    int16_t lLength = map(VU.lAverage, 0, VU.maxLevel, 0, GLOBAL.halfLedsNum);
     // ограничиваем до макс. числа светодиодов
-    Rlenght = constrain(Rlenght, 0, GLOBAL.halfLedsNum);
-    Llenght = constrain(Llenght, 0, GLOBAL.halfLedsNum);
-    vuAnimation();  // отрисовать
-  } else if (GLOBAL.disabledBrightness > 5) {
+    rLength = constrain(rLength, 0, GLOBAL.halfLedsNum);
+    lLength = constrain(lLength, 0, GLOBAL.halfLedsNum);
+
+    vuAnimation(rLength, lLength);
+  } else if (GLOBAL.disabledBrightness > 0) {
     silence();
   }
 }
 
-void fullFrequencyTransform() {
-  uint8_t freq_max = 0;
-  uint8_t* frequency = FREQUENCY.fullTransform.frequency;
-  for (uint8_t i = 0; i < 30; i++) {
-    if (fht_log_out[i + 2] > freq_max) {
-      freq_max = fht_log_out[i + 2];
-    }
-    if (freq_max < 5) {
-      freq_max = 5;
-    }
-
-    if (frequency[i] < fht_log_out[i + 2]) {
-      frequency[i] = fht_log_out[i + 2];
-    }
-    if (frequency[i] > FREQUENCY.fullTransform.smooth) {
-      frequency[i] -= FREQUENCY.fullTransform.smooth;
-    } else {
-      frequency[i] = 0;
-    }
-  }
-  FREQUENCY.fullTransform.maxFrequency =
-      freq_max * averK + FREQUENCY.fullTransform.maxFrequency * (1 - averK);
-}
-
-void lowMediumHighTransform() {
-  frequency[0] = 0;
-  frequency[1] = 0;
-  frequency[2] = 0;
-  for (int i = 0; i < 32; i++) {
-    if (fht_log_out[i] < FREQUENCY.signalThreshold) {
-      fht_log_out[i] = 0;
-    }
-  }
-  // низкие частоты, выборка со 2 по 5 тон (0 и 1 зашумленные!)
-  for (uint8_t i = 2; i < 6; i++) {
-    if (fht_log_out[i] > frequency[0]) {
-      frequency[0] = fht_log_out[i];
-    }
-  }
-  // средние частоты, выборка с 6 по 10 тон
-  for (uint8_t i = 6; i < 11; i++) {
-    if (fht_log_out[i] > frequency[1]) {
-      frequency[1] = fht_log_out[i];
-    }
-  }
-  // высокие частоты, выборка с 11 по 31 тон
-  for (uint8_t i = 11; i < 32; i++) {
-    if (fht_log_out[i] > frequency[2]) {
-      frequency[2] = fht_log_out[i];
-    }
-  }
-
-  // TODO rewrite
-  //Звук с одинаковыми частотами в итоге вырубит отображение вообще
-  for (uint8_t i = 0; i < 3; i++) {
-    // общая фильтрация
-    colorMusic_aver[i] =
-        frequency[i] * averK + colorMusic_aver[i] * (1 - averK);
-    // локальная
-    colorMusic_f[i] =
-        frequency[i] * SMOOTH_FREQ + colorMusic_f[i] * (1 - SMOOTH_FREQ);
-    if (colorMusic_f[i] > ((float)colorMusic_aver[i] * MAX_COEF_FREQ)) {
-      thisBright[i] = 255;
-      colorMusicFlash[i] = true;
-      running_flag[i] = true;
-    } else {
-      colorMusicFlash[i] = false;
-    }
-    if (thisBright[i] >= 0) {
-      thisBright[i] -= SMOOTH_STEP;
-    }
-    if (thisBright[i] < GLOBAL.disabledBrightness) {
-      thisBright[i] = GLOBAL.disabledBrightness;
-      running_flag[i] = false;
-    }
-  }
-}
-
-void processFrequency() {
-  analyzeAudio();
-  if (FREQUENCY.mode == 4) {
-    fullFrequencyTransform();
-  } else {
-    lowMediumHighTransform();
-  }
-  frequencyAnimation();
-}
-
-void vuAnimation() {
+void vuAnimation(int16_t rLength, int16_t lLength) {
   uint8_t count = 0;
-  uint16_t halfLedsNum = GLOBAL.halfLedsNum;
+  int16_t halfLedsNum = GLOBAL.halfLedsNum;
   float colorToLed = VU.colorToLed;
-
   if (VU.isRainbowOn) {
     // заливка по палитре радуга
     if (millis() - VU.rainbowTimer > 30) {
@@ -438,46 +330,47 @@ void vuAnimation() {
     }
     count = 0;
     // RainbowColors_p -  default FastLED pallet
-    for (int i = (halfLedsNum - 1); i > ((halfLedsNum - 1) - Rlenght);
+    for (int i = (halfLedsNum - 1); i > ((halfLedsNum - 1) - rLength);
          i--, count++) {
-      leds[i] = ColorFromPalette(RainbowColors_p,
-                                 (count * colorToLed) / 2 - VU.rainbowColor);
+      STRIP_LEDS[i] = ColorFromPalette(
+          RainbowColors_p, (count * colorToLed) / 2 - VU.rainbowColor);
     }
     count = 0;
-    for (int i = (halfLedsNum); i < (halfLedsNum + Llenght); i++, count++) {
-      leds[i] = ColorFromPalette(RainbowColors_p,
-                                 (count * colorToLed) / 2 - VU.rainbowColor);
+    for (int i = halfLedsNum; i < (halfLedsNum + lLength); i++, count++) {
+      STRIP_LEDS[i] = ColorFromPalette(
+          RainbowColors_p, (count * colorToLed) / 2 - VU.rainbowColor);
     }
   } else {
     // заливка по палитре " от зелёного к красному"
-    for (int i = (halfLedsNum - 1); i > ((halfLedsNum - 1) - Rlenght);
+    for (int i = (halfLedsNum - 1); i > ((halfLedsNum - 1) - rLength);
          i--, count++) {
-      leds[i] = ColorFromPalette(myPal, (count * colorToLed));
+      STRIP_LEDS[i] = ColorFromPalette(MY_PAL, (count * colorToLed));
     }
     count = 0;
-    for (int i = (GLOBAL.halfLedsNum); i < (GLOBAL.halfLedsNum + Llenght);
-         i++, count++) {
-      leds[i] = ColorFromPalette(myPal, (count * colorToLed));
+    for (int i = halfLedsNum; i < (halfLedsNum + lLength); i++, count++) {
+      STRIP_LEDS[i] = ColorFromPalette(MY_PAL, (count * colorToLed));
     }
   }
   if (GLOBAL.disabledBrightness > 0) {
-    colorEmptyLeds();
+    colorEmptyLeds(halfLedsNum - rLength, halfLedsNum - lLength);
   }
 }
 
-// DONE!
-void silence() {
-  fill_solid(leds, GLOBAL.numLeds,
-             CHSV(GLOBAL.disabledColor, 255, GLOBAL.disabledBrightness));
+void colorEmptyLeds(int16_t rDisabled, int16_t lDisabled) {
+  CHSV dark = CHSV(GLOBAL.disabledColor, 255, GLOBAL.disabledBrightness);
+  if (rDisabled > 0) {
+    fill_solid(STRIP_LEDS, rDisabled, dark);
+  }
+  if (lDisabled > 0) {
+    fill_solid(&(STRIP_LEDS[GLOBAL.numLeds - lDisabled]), lDisabled, dark);
+  }
 }
-// DONE!
-void fillLeds(CHSV color) { fill_solid(leds, GLOBAL.numLeds, color); }
 
 // DONE!
 void backlightAnimation() {
   switch (BACKLIGHT.mode) {
     case 0:
-      fillLeds(CHSV(BACKLIGHT.defaultColor, BACKLIGHT.defaultSaturation, 255));
+      fillLeds(CHSV(BACKLIGHT.defaultHue, BACKLIGHT.defaultSaturation, 255));
       break;
     case 1:
       if (millis() - BACKLIGHT.colorChangeTime > BACKLIGHT.colorChangeDelay) {
@@ -493,7 +386,7 @@ void backlightAnimation() {
       }
       uint8_t rainbowStep = BACKLIGHT.currentColor;
       for (uint16_t i = 0; i < GLOBAL.numLeds; i++) {
-        leds[i] = CHSV(rainbowStep, 255, 255);
+        STRIP_LEDS[i] = CHSV(rainbowStep, 255, 255);
         rainbowStep += BACKLIGHT.rainbowStep;
       }
       break;
@@ -520,157 +413,239 @@ void processStrobe() {
 // DONE!
 void strobeAnimation() {
   if (STROBE.bright > 0) {
-    fillLeds(CHSV(STROBE.color, STROBE.saturation, STROBE.bright));
+    fillLeds(CHSV(STROBE.hue, STROBE.saturation, STROBE.bright));
   } else {
     fillLeds(CHSV(GLOBAL.disabledColor, 255, GLOBAL.disabledBrightness));
   }
 }
 
-void frequencyAnimation() {
-  switch (FREQUENCY.mode) {
-    // DONE!
+void processFrequency() {
+  analyzeAudio();
+  if (FREQUENCY.isFullTransform) {
+    fullFrequencyTransform();
+  } else {
+    lmhTransform();
+  }
+}
+
+void analyzeAudio() {
+  for (int i = 0; i < FHT_N; i++) {
+    fht_input[i] = analogRead(SOUND_R_FREQ);  // put real data into bins
+  }
+  fht_window();   // window the data for better frequency response
+  fht_reorder();  // reorder the data before doing the fht
+  fht_run();      // process the data in the fht
+  fht_mag_log();  // take the output of the fht
+}
+
+void fullFrequencyTransform() {
+  uint8_t freqMax = 0;
+  uint8_t* frequency = FREQUENCY.fullTransform.frequency;
+  for (uint8_t i = 0; i < 30; i++) {
+    if (fht_log_out[i + 2] > freqMax) {
+      freqMax = fht_log_out[i + 2];
+    }
+    if (freqMax < 5) {
+      freqMax = 5;
+    }
+
+    if (frequency[i] < fht_log_out[i + 2]) {
+      frequency[i] = fht_log_out[i + 2];
+    } else if (frequency[i] > FREQUENCY.fullTransform.smooth) {
+      frequency[i] -= FREQUENCY.fullTransform.smooth;
+    } else {
+      frequency[i] = 0;
+    }
+  }
+  FREQUENCY.fullTransform.maxFrequency =
+      freqMax * averK + FREQUENCY.fullTransform.maxFrequency * (1 - averK);
+  fullFrequencyAnimation();
+}
+
+void fullFrequencyAnimation() {
+  uint8_t hue = FREQUENCY.fullTransform.lowFrequencyHue;
+  uint8_t stripSize;
+  uint8_t bright;
+  uint16_t position = 0;
+  for (uint8_t i = 0; i < 30; i++) {
+    stripSize = (float)i * FREQUENCY.fullTransform.ledsForFreq + 0.5;
+    bright = map(FREQUENCY.fullTransform.frequency[30 - 1 - i], 0,
+                 FREQUENCY.fullTransform.maxFrequency, 0, 255);
+    fill_solid(STRIP_LEDS + position, stripSize, CHSV(hue, 255, bright));
+    fill_solid(&(STRIP_LEDS[GLOBAL.numLeds - stripSize - position - 1]),
+               stripSize, CHSV(hue, 255, bright));
+    hue += FREQUENCY.fullTransform.hueStep;
+    position += stripSize;
+  }
+}
+
+void lmhTransform() {
+  uint8_t frequency[3];
+  frequency[0] = 0;
+  frequency[1] = 0;
+  frequency[2] = 0;
+
+  // низкие частоты, выборка со 2 по 5 тон (0 и 1 зашумленные!)
+  for (uint8_t i = 2; i < 6; i++) {
+    if (fht_log_out[i] > frequency[0] &&
+        fht_log_out[i] > FREQUENCY.signalThreshold) {
+      frequency[0] = fht_log_out[i];
+    }
+  }
+  // средние частоты, выборка с 6 по 10 тон
+  for (uint8_t i = 6; i < 11; i++) {
+    if (fht_log_out[i] > frequency[1] &&
+        fht_log_out[i] > FREQUENCY.signalThreshold) {
+      frequency[1] = fht_log_out[i];
+    }
+  }
+  // высокие частоты, выборка с 11 по 31 тон
+  for (uint8_t i = 11; i < 32; i++) {
+    if (fht_log_out[i] > frequency[2] &&
+        fht_log_out[i] > FREQUENCY.signalThreshold) {
+      frequency[2] = fht_log_out[i];
+    }
+  }
+
+  //Звук с одинаковыми частотами в итоге вырубит отображение вообще
+  float value;
+  for (uint8_t i = 0; i < 3; i++) {
+    value = frequency[i] * FREQUENCY.lmhTransform.smooth +
+            FREQUENCY.lmhTransform.averageFrequency[i] *
+                (1 - FREQUENCY.lmhTransform.smooth);
+    if (value > FREQUENCY.lmhTransform.averageFrequency[i] *
+                    FREQUENCY.lmhTransform.flashMultiplier) {
+      FREQUENCY.lmhTransform.bright[i] = 255;
+      FREQUENCY.lmhTransform.isFlash[i] = true;
+    } else {
+      FREQUENCY.lmhTransform.isFlash[i] = false;
+    }
+    if (FREQUENCY.lmhTransform.bright[i] >= 0) {
+      FREQUENCY.lmhTransform.bright[i] -= FREQUENCY.lmhTransform.step;
+    }
+    if (FREQUENCY.lmhTransform.bright[i] < GLOBAL.disabledBrightness) {
+      FREQUENCY.lmhTransform.bright[i] = GLOBAL.disabledBrightness;
+    }
+    FREQUENCY.lmhTransform.averageFrequency[i] = value;
+  }
+  lmhFrequencyAnimation();
+}
+
+void lmhFrequencyAnimation() {
+  switch (FREQUENCY.lmhTransform.mode) {
     case 0: {
-      uint16_t strip = GLOBAL.numLeds / 5;
-      fill_solid(leds, strip, CHSV(HIGH_COLOR, 255, thisBright[2]));
-      fill_solid(leds + strip, strip, CHSV(MID_COLOR, 255, thisBright[1]));
-      fill_solid(leds + 2 * strip, strip, CHSV(LOW_COLOR, 255, thisBright[0]));
-      fill_solid(leds + 3 * strip, strip, CHSV(MID_COLOR, 255, thisBright[1]));
-      fill_solid(leds + 4 * strip, strip, CHSV(HIGH_COLOR, 255, thisBright[2]));
+      uint16_t stripLenght = GLOBAL.numLeds / 5;
+      fill_solid(STRIP_LEDS, stripLenght,
+                 CHSV(FREQUENCY.lmhTransform.colors[2], 255,
+                      FREQUENCY.lmhTransform.bright[2]));
+      fill_solid(STRIP_LEDS + stripLenght, stripLenght,
+                 CHSV(FREQUENCY.lmhTransform.colors[1], 255,
+                      FREQUENCY.lmhTransform.bright[1]));
+      fill_solid(STRIP_LEDS + 2 * stripLenght, stripLenght,
+                 CHSV(FREQUENCY.lmhTransform.colors[0], 255,
+                      FREQUENCY.lmhTransform.bright[0]));
+      fill_solid(STRIP_LEDS + 3 * stripLenght, stripLenght,
+                 CHSV(FREQUENCY.lmhTransform.colors[1], 255,
+                      FREQUENCY.lmhTransform.bright[1]));
+      fill_solid(STRIP_LEDS + 4 * stripLenght, stripLenght,
+                 CHSV(FREQUENCY.lmhTransform.colors[2], 255,
+                      FREQUENCY.lmhTransform.bright[2]));
       break;
     }
-    // DONE!
     case 1: {
-      uint16_t strip = GLOBAL.numLeds / 3;
-      fill_solid(leds, strip, CHSV(HIGH_COLOR, 255, thisBright[2]));
-      fill_solid(leds + strip, strip, CHSV(MID_COLOR, 255, thisBright[1]));
-      fill_solid(leds + 2 * strip, strip, CHSV(LOW_COLOR, 255, thisBright[0]));
+      uint16_t stripLenght = GLOBAL.numLeds / 3;
+      for (uint8_t i = 0; i < 3; i++) {
+        fill_solid(STRIP_LEDS + i * stripLenght, stripLenght,
+                   CHSV(FREQUENCY.lmhTransform.colors[i], 255,
+                        FREQUENCY.lmhTransform.bright[i]));
+      }
       break;
     }
     case 2:
-      // FIXME
-      switch (1) {
-        case 0:
-          if (colorMusicFlash[2])
-            fillLeds(CHSV(HIGH_COLOR, 255, thisBright[2]));
-          else if (colorMusicFlash[1])
-            fillLeds(CHSV(MID_COLOR, 255, thisBright[1]));
-          else if (colorMusicFlash[0])
-            fillLeds(CHSV(LOW_COLOR, 255, thisBright[0]));
-          else
-            silence();
-          break;
-        case 1:
-          if (colorMusicFlash[2])
-            fillLeds(CHSV(HIGH_COLOR, 255, thisBright[2]));
-          else
-            silence();
-          break;
-        case 2:
-          if (colorMusicFlash[1])
-            fillLeds(CHSV(MID_COLOR, 255, thisBright[1]));
-          else
-            silence();
-          break;
-        case 3:
-          if (colorMusicFlash[0])
-            fillLeds(CHSV(LOW_COLOR, 255, thisBright[0]));
-          else
-            silence();
-          break;
+      if (FREQUENCY.lmhTransform.oneLine.mode == 4) {
+        if (FREQUENCY.lmhTransform.isFlash[2])
+          fillLeds(CHSV(FREQUENCY.lmhTransform.colors[2], 255,
+                        FREQUENCY.lmhTransform.bright[2]));
+        else if (FREQUENCY.lmhTransform.isFlash[1])
+          fillLeds(CHSV(FREQUENCY.lmhTransform.colors[1], 255,
+                        FREQUENCY.lmhTransform.bright[1]));
+        else if (FREQUENCY.lmhTransform.isFlash[0])
+          fillLeds(CHSV(FREQUENCY.lmhTransform.colors[0], 255,
+                        FREQUENCY.lmhTransform.bright[0]));
+        else
+          silence();
+      } else {
+        if (FREQUENCY.lmhTransform.isFlash[FREQUENCY.lmhTransform.oneLine.mode])
+          fillLeds(CHSV(FREQUENCY.lmhTransform
+                            .colors[FREQUENCY.lmhTransform.oneLine.mode],
+                        255,
+                        FREQUENCY.lmhTransform
+                            .bright[FREQUENCY.lmhTransform.oneLine.mode]));
+        else
+          silence();
       }
       break;
     case 3:
       //Показывает обычно просто средние - т.к. цепляет их чаще, низки почти не
       //попадают
       // if moved from end here.
-      if (millis() - FREQUENCY.runningFrequency.runDelay >
-          FREQUENCY.runningFrequency.speed) {
-        FREQUENCY.runningFrequency.runDelay = millis();
-        switch (FREQUENCY.runningFrequency.mode) {
-          case 0:
-            if (running_flag[2])
-              leds[GLOBAL.halfLedsNum] = CHSV(HIGH_COLOR, 255, thisBright[2]);
-            else if (running_flag[1])
-              leds[GLOBAL.halfLedsNum] = CHSV(MID_COLOR, 255, thisBright[1]);
-            else if (running_flag[0])
-              leds[GLOBAL.halfLedsNum] = CHSV(LOW_COLOR, 255, thisBright[0]);
-            else
-              leds[GLOBAL.halfLedsNum] =
-                  CHSV(GLOBAL.disabledColor, 255, GLOBAL.disabledBrightness);
-            break;
-          case 1:
-            if (running_flag[2])
-              leds[GLOBAL.halfLedsNum] = CHSV(HIGH_COLOR, 255, thisBright[2]);
-            else
-              leds[GLOBAL.halfLedsNum] =
-                  CHSV(GLOBAL.disabledColor, 255, GLOBAL.disabledBrightness);
-            break;
-          case 2:
-            if (running_flag[1])
-              leds[GLOBAL.halfLedsNum] = CHSV(MID_COLOR, 255, thisBright[1]);
-            else
-              leds[GLOBAL.halfLedsNum] =
-                  CHSV(GLOBAL.disabledColor, 255, GLOBAL.disabledBrightness);
-            break;
-          case 3:
-            if (running_flag[0])
-              leds[GLOBAL.halfLedsNum] = CHSV(LOW_COLOR, 255, thisBright[0]);
-            else
-              leds[GLOBAL.halfLedsNum] =
-                  CHSV(GLOBAL.disabledColor, 255, GLOBAL.disabledBrightness);
-            break;
+      if (millis() - FREQUENCY.lmhTransform.runningFrequency.runDelay >
+          FREQUENCY.lmhTransform.runningFrequency.speed) {
+        FREQUENCY.lmhTransform.runningFrequency.runDelay = millis();
+        if (FREQUENCY.lmhTransform.runningFrequency.mode == 4) {
+          if (FREQUENCY.lmhTransform.isFlash[2])
+            STRIP_LEDS[GLOBAL.halfLedsNum] =
+                CHSV(FREQUENCY.lmhTransform.colors[2], 255,
+                     FREQUENCY.lmhTransform.bright[2]);
+          else if (FREQUENCY.lmhTransform.isFlash[1])
+            STRIP_LEDS[GLOBAL.halfLedsNum] =
+                CHSV(FREQUENCY.lmhTransform.colors[1], 255,
+                     FREQUENCY.lmhTransform.bright[1]);
+          else if (FREQUENCY.lmhTransform.isFlash[0])
+            STRIP_LEDS[GLOBAL.halfLedsNum] =
+                CHSV(FREQUENCY.lmhTransform.colors[0], 255,
+                     FREQUENCY.lmhTransform.bright[0]);
+          else
+            STRIP_LEDS[GLOBAL.halfLedsNum] =
+                CHSV(GLOBAL.disabledColor, 255, GLOBAL.disabledBrightness);
+        } else {
+          if (FREQUENCY.lmhTransform
+                  .isFlash[FREQUENCY.lmhTransform.oneLine.mode]) {
+            STRIP_LEDS[GLOBAL.halfLedsNum] =
+                CHSV(FREQUENCY.lmhTransform
+                         .colors[FREQUENCY.lmhTransform.oneLine.mode],
+                     255,
+                     FREQUENCY.lmhTransform
+                         .bright[FREQUENCY.lmhTransform.oneLine.mode]);
+          } else {
+            STRIP_LEDS[GLOBAL.halfLedsNum] =
+                CHSV(GLOBAL.disabledColor, 255, GLOBAL.disabledBrightness);
+          }
         }
-        leds[GLOBAL.halfLedsNum - 1] = leds[GLOBAL.halfLedsNum];
+        STRIP_LEDS[GLOBAL.halfLedsNum - 1] = STRIP_LEDS[GLOBAL.halfLedsNum];
         for (uint16_t i = 0; i < GLOBAL.halfLedsNum - 1; i++) {
-          leds[i] = leds[i + 1];
-          leds[GLOBAL.numLeds - i - 1] = leds[i];
+          STRIP_LEDS[i] = STRIP_LEDS[i + 1];
+          STRIP_LEDS[GLOBAL.numLeds - i - 1] = STRIP_LEDS[i];
         }
       }
       break;
-      // DONE!
-    case 4:
-      uint8_t hue = FREQUENCY.fullTransform.lowFrequencyHue;
-      uint8_t stripSize;
-      uint8_t bright;
-      uint16_t position = 0;
-      for (uint8_t i = 0; i < 30; i++) {
-        stripSize = (float)i * FREQUENCY.fullTransform.ledsForFreq + 0.5;
-        bright = map(FREQUENCY.fullTransform.frequency[30 - 1 - i], 0,
-                     FREQUENCY.fullTransform.maxFrequency, 0, 255);
-        fill_solid(leds + position, stripSize, CHSV(hue, 255, bright));
-        fill_solid(&(leds[GLOBAL.numLeds - stripSize - position - 1]),
-                   stripSize, CHSV(hue, 255, bright));
-        hue += FREQUENCY.fullTransform.hueStep;
-        position += stripSize;
-      }
-      break;
-  }
-}
-
-void colorEmptyLeds() {
-  CHSV this_dark = CHSV(GLOBAL.disabledColor, 255, GLOBAL.disabledBrightness);
-  for (int i = ((GLOBAL.halfLedsNum - 1) - Rlenght); i > 0; i--) {
-    leds[i] = this_dark;
-  }
-  for (int i = GLOBAL.halfLedsNum + Llenght; i < NUM_LEDS; i++) {
-    leds[i] = this_dark;
   }
 }
 
 float calcSoundLevel(float level) {
-  level = map(level, VU.signalThreshold, 1023, 0,
-              500);  // фильтруем по нижнему порогу шумов
+  // фильтруем по нижнему порогу шумов
+  level = map(level, VU.signalThreshold, 1023, 0, 500);
   level = constrain(level, 0, 500);  // ограничиваем диапазон
-  level = pow(level, GLOBAL.expCoeffincient);  // возводим в степень (для
-                                               // большей чёткости работы)
-  return level;
+  // возводим в степень (для большей чёткости работы)
+  return pow(level, GLOBAL.expCoeffincient);
 }
 
-void setThreshold() {
-  delay(1000);  // ждём инициализации АЦП
-  VU.setAutoThreshold();
-  FREQUENCY.setAutoThreshold();
+void silence() {
+  fill_solid(STRIP_LEDS, GLOBAL.numLeds,
+             CHSV(GLOBAL.disabledColor, 255, GLOBAL.disabledBrightness));
 }
+
+void fillLeds(CHSV color) { fill_solid(STRIP_LEDS, GLOBAL.numLeds, color); }
 
 bool isReceiving;
 bool isMessageReceived;
