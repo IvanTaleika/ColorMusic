@@ -123,9 +123,8 @@ struct VuAnalyzer {
     int level;
     for (uint8_t i = 0; i < 200; i++) {
       level = analogRead(SOUND_R);  // делаем 200 измерений
-      if (level > maxLevel &&
-          (!GLOBAL.isMicro && level < 150)) {  // ищем максимумы
-        maxLevel = level;                      // запоминаем
+      if (level > maxLevel && level < 150) {  // ищем максимумы
+        maxLevel = level;                     // запоминаем
       }
       delay(4);  // ждём 4мс
     }
