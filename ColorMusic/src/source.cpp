@@ -30,7 +30,7 @@
 #define LOG_OUT 1  // FOR FHT.h lib
 #include "source.h"
 #include <FHT.h>  // преобразование Хартли
-
+#include <SoftwareSerial.h>
 // градиент-палитра от зелёного к красному
 DEFINE_GRADIENT_PALETTE(soundlevel_gp){
     0,   0,   255, 0,  // green
@@ -86,16 +86,19 @@ void initLeds() {
 void setThreshold() {
   delay(1000);  // ждём инициализации АЦП
   setVuThreshold();
-  Serial.print("setVuThreshold=");
-  Serial.println(VU.signalThreshold);
+  // Serial.print("setVuThreshold=");
+  // Serial.println(VU.signalThreshold);
   setFrequencyThreshold();
-  Serial.print("setFrequencyThreshold=");
-  Serial.println(FREQUENCY.signalThreshold);
+  // Serial.print("setFrequencyThreshold=");
+  // Serial.println(FREQUENCY.signalThreshold);
 }
 
 void setVuThreshold() {
   int maxLevel = 0;  // максимум
   int level;
+  for (uint8_t i = 0; i < 50; i++) {
+    analogRead(GLOBAL.soundRightPin);  // Clear trash in port
+  }
   for (uint8_t i = 0; i < 200; i++) {
     level = analogRead(GLOBAL.soundRightPin);  // делаем 200 измерений
     if (level > maxLevel) {                    // ищем максимумы
@@ -114,6 +117,7 @@ void setFrequencyThreshold() {
     analyzeAudio();                     // разбить в спектр
     for (uint8_t j = 2; j < 32; j++) {  // первые 2 канала - хлам
       level = fht_log_out[j];
+
       if (level > maxLevel) {  // ищем максимумы
         maxLevel = level;      // запоминаем
       }
@@ -169,6 +173,10 @@ void processLevel() {
       }
     }
   }
+  // Serial.print("rMax=");
+  // Serial.println(rMax);
+  // Serial.print("lMax=");
+  // Serial.println(lMax);
   // фильтр скользящее среднее
   VU.rAverage = (float)rMax * VU.smooth + VU.rAverage * (1 - VU.smooth);
 
@@ -179,11 +187,11 @@ void processLevel() {
     VU.lAverage = VU.rAverage;
   }
 
-  if (VU.rAverage > VU.signalThreshold && VU.lAverage > VU.signalThreshold) {
-    // расчёт общей средней громкости с обоих каналов, фильтрация.
-    // Фильтр очень медленный, сделано специально для автогромкости
-    VU.averageLevel = (float)(VU.rAverage + VU.lAverage) / 2. * averK +
-                      VU.averageLevel * (1 - averK);
+  // расчёт общей средней громкости с обоих каналов, фильтрация.
+  // Фильтр очень медленный, сделано специально для автогромкости
+  VU.averageLevel = (float)(VU.rAverage + VU.lAverage) / 2. * averK +
+                    VU.averageLevel * (1 - averK);
+  if (VU.rAverage > VU.signalThreshold || VU.lAverage > VU.signalThreshold) {
     // принимаем максимальную громкость шкалы как среднюю, умноженную на
     // некоторый коэффициент maxMultiplier
     VU.maxLevel = VU.averageLevel * VU.maxMultiplier;
@@ -257,17 +265,17 @@ void backlightAnimation() {
     case 1:
       if (millis() - BACKLIGHT.colorChangeTime > BACKLIGHT.colorChangeDelay) {
         BACKLIGHT.colorChangeTime = millis();
-        BACKLIGHT.currentColor++;
+        BACKLIGHT.currentHue++;
       }
-      fillLeds(CHSV(BACKLIGHT.currentColor, BACKLIGHT.color.saturation,
+      fillLeds(CHSV(BACKLIGHT.currentHue, BACKLIGHT.color.saturation,
                     BACKLIGHT.color.val));
       break;
     case 2:
       if (millis() - BACKLIGHT.colorChangeTime > BACKLIGHT.colorChangeDelay) {
         BACKLIGHT.colorChangeTime = millis();
-        BACKLIGHT.currentColor += BACKLIGHT.rainbowColorStep;
+        BACKLIGHT.currentHue += BACKLIGHT.rainbowColorStep;
       }
-      uint8_t rainbowStep = BACKLIGHT.currentColor;
+      uint8_t rainbowStep = BACKLIGHT.currentHue;
       for (uint16_t i = 0; i < GLOBAL.numLeds; i++) {
         STRIP_LEDS[i] =
             CHSV(rainbowStep, BACKLIGHT.color.saturation, BACKLIGHT.color.val);
@@ -402,12 +410,12 @@ void lmhTransform() {
       FREQUENCY.lmhTransform.isFlash[i] = true;
     } else {
       FREQUENCY.lmhTransform.isFlash[i] = false;
-    }
-    if (FREQUENCY.lmhTransform.bright[i] >= 0) {
-      FREQUENCY.lmhTransform.bright[i] -= FREQUENCY.lmhTransform.step;
-    }
-    if (FREQUENCY.lmhTransform.bright[i] < GLOBAL.disabledBrightness) {
-      FREQUENCY.lmhTransform.bright[i] = GLOBAL.disabledBrightness;
+      if (FREQUENCY.lmhTransform.bright[i] < FREQUENCY.lmhTransform.step ||
+          FREQUENCY.lmhTransform.bright[i] < GLOBAL.disabledBrightness) {
+        FREQUENCY.lmhTransform.bright[i] = GLOBAL.disabledBrightness;
+      } else {
+        FREQUENCY.lmhTransform.bright[i] -= FREQUENCY.lmhTransform.step;
+      }
     }
     FREQUENCY.lmhTransform.averageFrequency[i] = value;
   }
@@ -445,7 +453,7 @@ void lmhFrequencyAnimation() {
       break;
     }
     case 2:
-      if (FREQUENCY.lmhTransform.oneLine.mode == 4) {
+      if (FREQUENCY.lmhTransform.oneLine.mode == 3) {
         if (FREQUENCY.lmhTransform.isFlash[2])
           fillLeds(CHSV(FREQUENCY.lmhTransform.colors[2], 255,
                         FREQUENCY.lmhTransform.bright[2]));
@@ -471,11 +479,24 @@ void lmhFrequencyAnimation() {
     case 3:
       //Показывает обычно просто средние - т.к. цепляет их чаще, низки почти не
       //попадают
-      // if moved from end here.
       if (millis() - FREQUENCY.lmhTransform.runningFrequency.runDelay >
           FREQUENCY.lmhTransform.runningFrequency.speed) {
+        Serial.println("runningFrequency");
+        Serial.print("isFlash[2]=");
+        Serial.println(FREQUENCY.lmhTransform.isFlash[2]);
+        Serial.print("isFlash[1]=");
+        Serial.println(FREQUENCY.lmhTransform.isFlash[1]);
+        Serial.print("isFlash[0]=");
+        Serial.println(FREQUENCY.lmhTransform.isFlash[0]);
+        for (uint16_t i = 0; i < GLOBAL.halfLedsNum - 1; i++) {
+          Serial.print(i);
+          Serial.print(" ");
+
+          STRIP_LEDS[i] = STRIP_LEDS[i + 1];
+          STRIP_LEDS[GLOBAL.numLeds - i - 1] = STRIP_LEDS[i];
+        }
         FREQUENCY.lmhTransform.runningFrequency.runDelay = millis();
-        if (FREQUENCY.lmhTransform.runningFrequency.mode == 4) {
+        if (FREQUENCY.lmhTransform.runningFrequency.mode == 3) {
           if (FREQUENCY.lmhTransform.isFlash[2])
             STRIP_LEDS[GLOBAL.halfLedsNum] =
                 CHSV(FREQUENCY.lmhTransform.colors[2], 255,
@@ -506,10 +527,6 @@ void lmhFrequencyAnimation() {
           }
         }
         STRIP_LEDS[GLOBAL.halfLedsNum - 1] = STRIP_LEDS[GLOBAL.halfLedsNum];
-        for (uint16_t i = 0; i < GLOBAL.halfLedsNum - 1; i++) {
-          STRIP_LEDS[i] = STRIP_LEDS[i + 1];
-          STRIP_LEDS[GLOBAL.numLeds - i - 1] = STRIP_LEDS[i];
-        }
       }
       break;
   }
@@ -531,27 +548,22 @@ void silence() {
 void fillLeds(CHSV color) { fill_solid(STRIP_LEDS, GLOBAL.numLeds, color); }
 
 void checkBluetooth() {
-  if (BLUETOOTH_SERIAL.available()) {
-    readBluetooth();
-  }
-  if (BLUETOOTH.isMessageReceived) {
-    processMessage();
-  }
-}
-
-void readBluetooth() {
-  char incomingByte = BLUETOOTH_SERIAL.read();
-  if (BLUETOOTH.isReceiving) {
-    if (incomingByte == END_BYTE) {
-      BLUETOOTH.isReceiving = false;
-      BLUETOOTH.isMessageReceived = true;
-    } else {
-      BLUETOOTH.message += incomingByte;
+  if (BLUETOOTH_SERIAL.available() > 0) {
+    char incomingByte = BLUETOOTH_SERIAL.read();
+    if (incomingByte == START_BYTE) {
+      BLUETOOTH.messageSize = 0;
+      while (incomingByte != END_BYTE) {
+        if (BLUETOOTH_SERIAL.available() > 0) {
+          incomingByte = BLUETOOTH_SERIAL.read();
+          if (incomingByte == END_BYTE) {
+            BLUETOOTH.message[BLUETOOTH.messageSize] = '\0';
+            processMessage();
+          } else {
+            BLUETOOTH.message[BLUETOOTH.messageSize++] = incomingByte;
+          }
+        }
+      }
     }
-  }
-  if (incomingByte == START_BYTE) {
-    BLUETOOTH.isReceiving = true;
-    BLUETOOTH.message = "";
   }
 }
 
@@ -560,7 +572,7 @@ void processMessage() {
   Serial.println(BLUETOOTH.message);
   Serial.print("state=");
   Serial.println(BLUETOOTH.state);
-  uint8_t destination = BLUETOOTH.message.substring(0, 1).toInt();
+  uint8_t destination = substrToInt(BLUETOOTH.message, 0, 1);
   uint8_t result = 0;
   switch (destination) {
     case 0:
@@ -588,21 +600,21 @@ void processMessage() {
   if (result) {
     BLUETOOTH.state = result;
   }
-  BLUETOOTH.isMessageReceived = false;
 }
 
-uint8_t globalUpdate(String& message) {
-  auto setting = static_cast<Global::Setting>(message.substring(1, 3).toInt());
+uint8_t globalUpdate(char* charArray) {
+  auto setting =
+      static_cast<Global::Setting>(substrToInt(BLUETOOTH.message, 1, 3));
   switch (setting) {
     case Global::ON_OFF:
-      GLOBAL.isOn = message.substring(3).toInt();
+      GLOBAL.isOn = substrToInt(BLUETOOTH.message, 3, BLUETOOTH.messageSize);
       if (GLOBAL.isOn == false) {
         fillLeds(CHSV(0, 0, 0));
         FastLED.show();
       }
       return 0;
     case Global::MICRO:
-      GLOBAL.isMicro = message.substring(3).toInt();
+      GLOBAL.isMicro = substrToInt(BLUETOOTH.message, 3, BLUETOOTH.messageSize);
       if (GLOBAL.isMicro) {
         GLOBAL.soundRightPin = Global::MICRO_RIGHT_PIN;
         GLOBAL.soundFrequencyPin = Global::MICRO_FREQUENCY_PIN;
@@ -614,27 +626,28 @@ uint8_t globalUpdate(String& message) {
       setThreshold();
       return 0;
     case Global::STEREO:
-      GLOBAL.isStereo = message.substring(3).toInt();
+      GLOBAL.isStereo =
+          substrToInt(BLUETOOTH.message, 3, BLUETOOTH.messageSize);
       return 0;
     case Global::MODE:
-      GLOBAL.currentMode = message.substring(3).toInt();
+      GLOBAL.currentMode =
+          substrToInt(BLUETOOTH.message, 3, BLUETOOTH.messageSize);
       return 0;
     case Global::N_LEDS:
-      GLOBAL.numLeds = message.substring(3).toInt();
+      fillLeds(CHSV(0, 0, 0));
+      FastLED.show();
+      GLOBAL.numLeds = substrToInt(BLUETOOTH.message, 3, BLUETOOTH.messageSize);
       initLeds();
       return 0;
     case Global::ENABLED_BRIGHTNESS:
-      GLOBAL.enabledBrightness = message.substring(3).toInt();
+      GLOBAL.enabledBrightness =
+          substrToInt(BLUETOOTH.message, 3, BLUETOOTH.messageSize);
       FastLED.setBrightness(GLOBAL.enabledBrightness);
       return 0;
     case Global::DISABLED_COLOR: {
-      CHSV color = parseHsvColor(message.substring(3));
+      CHSV color = parseHsvColor(BLUETOOTH.message, 3, BLUETOOTH.messageSize);
       GLOBAL.disabledHue = color.hue;
       GLOBAL.disabledBrightness = color.val;
-      Serial.print("GLOBAL.disabledHue=");
-      Serial.println(GLOBAL.disabledHue);
-      Serial.print("GLOBAL.disabledBrightness=");
-      Serial.println(GLOBAL.disabledBrightness);
       return 0;
     }
     case Global::UPDATE_THRESHOLD:
@@ -645,152 +658,141 @@ uint8_t globalUpdate(String& message) {
   }
 }
 
-uint8_t vuUpdate(String& message) {
+uint8_t vuUpdate(char* charArray) {
   auto setting =
-      static_cast<VuAnalyzer::Setting>(message.substring(1, 3).toInt());
+      static_cast<VuAnalyzer::Setting>(substrToInt(BLUETOOTH.message, 1, 3));
   switch (setting) {
     case VuAnalyzer::SMOOTH:
-      VU.smooth = message.substring(3).toDouble();
+      VU.smooth = substrToDouble(BLUETOOTH.message, 3, BLUETOOTH.messageSize);
       return 0;
     case VuAnalyzer::IS_RAINBOW:
-      VU.isRainbowOn = message.substring(3).toInt();
+      VU.isRainbowOn = substrToInt(BLUETOOTH.message, 3, BLUETOOTH.messageSize);
       return 0;
     case VuAnalyzer::RAINBOW_STEP:
-      VU.rainbowStep = message.substring(3).toInt();
+      VU.rainbowStep = substrToInt(BLUETOOTH.message, 3, BLUETOOTH.messageSize);
       return 0;
     default:
       return 3;
   }
 }
-uint8_t frequencyUpdate(String& message) {
-  auto setting =
-      static_cast<FrequencyAnalyzer::Setting>(message.substring(1, 3).toInt());
+uint8_t frequencyUpdate(char* charArray) {
+  auto setting = static_cast<FrequencyAnalyzer::Setting>(
+      substrToInt(BLUETOOTH.message, 1, 3));
   switch (setting) {
     case FrequencyAnalyzer::IS_FULL_TRANSFORM:
-      FREQUENCY.isFullTransform = message.substring(3).toInt();
+      FREQUENCY.isFullTransform =
+          substrToInt(BLUETOOTH.message, 3, BLUETOOTH.messageSize);
       return 0;
     case FrequencyAnalyzer::LMH_MODE:
-      FREQUENCY.lmhTransform.mode = message.substring(3).toInt();
-      return 0;
-    case FrequencyAnalyzer::ONE_LINE_MODE:
-      FREQUENCY.lmhTransform.oneLine.mode = message.substring(3).toInt();
-      return 0;
-    case FrequencyAnalyzer::RUNNING_MODE:
-      FREQUENCY.lmhTransform.runningFrequency.mode =
-          message.substring(3).toInt();
-      return 0;
-    case FrequencyAnalyzer::RUNNING_SPEED:
-      FREQUENCY.lmhTransform.runningFrequency.speed =
-          message.substring(3).toInt();
+      FREQUENCY.lmhTransform.mode =
+          substrToInt(BLUETOOTH.message, 3, BLUETOOTH.messageSize);
       return 0;
     case FrequencyAnalyzer::LHM_LOW_HUE:
       FREQUENCY.lmhTransform.colors[0] =
-          parseHsvColor(message.substring(3)).hue;
+          substrToInt(BLUETOOTH.message, 3, BLUETOOTH.messageSize);
       return 0;
     case FrequencyAnalyzer::LHM_MEDIUM_HUE:
       FREQUENCY.lmhTransform.colors[1] =
-          parseHsvColor(message.substring(3)).hue;
+          substrToInt(BLUETOOTH.message, 3, BLUETOOTH.messageSize);
       return 0;
     case FrequencyAnalyzer::LHM_HIGH_HUE:
       FREQUENCY.lmhTransform.colors[2] =
-          parseHsvColor(message.substring(3)).hue;
+          substrToInt(BLUETOOTH.message, 3, BLUETOOTH.messageSize);
       return 0;
     case FrequencyAnalyzer::LHM_SMOOTH:
-      FREQUENCY.lmhTransform.smooth = message.substring(3).toDouble();
+      FREQUENCY.lmhTransform.smooth =
+          substrToDouble(BLUETOOTH.message, 3, BLUETOOTH.messageSize);
       return 0;
     case FrequencyAnalyzer::LHM_STEP:
-      FREQUENCY.lmhTransform.step = message.substring(3).toInt();
+      FREQUENCY.lmhTransform.step =
+          substrToInt(BLUETOOTH.message, 3, BLUETOOTH.messageSize);
+      return 0;
+    case FrequencyAnalyzer::ONE_LINE_MODE:
+      FREQUENCY.lmhTransform.oneLine.mode =
+          substrToInt(BLUETOOTH.message, 3, BLUETOOTH.messageSize);
+      return 0;
+    case FrequencyAnalyzer::RUNNING_MODE:
+      FREQUENCY.lmhTransform.runningFrequency.mode =
+          substrToInt(BLUETOOTH.message, 3, BLUETOOTH.messageSize);
+      return 0;
+    case FrequencyAnalyzer::RUNNING_SPEED:
+      FREQUENCY.lmhTransform.runningFrequency.speed =
+          substrToInt(BLUETOOTH.message, 3, BLUETOOTH.messageSize);
       return 0;
     case FrequencyAnalyzer::FULL_LOW_HUE:
       FREQUENCY.fullTransform.lowFrequencyHue =
-          parseHsvColor(message.substring(3)).hue;
+          parseHsvColor(BLUETOOTH.message, 3, BLUETOOTH.messageSize).hue;
       return 0;
     case FrequencyAnalyzer::FULL_SMOOTH:
-      FREQUENCY.fullTransform.smooth = message.substring(3).toInt();
+      FREQUENCY.fullTransform.smooth =
+          substrToInt(BLUETOOTH.message, 3, BLUETOOTH.messageSize);
       return 0;
     case FrequencyAnalyzer::FULL_HUE_STEP:
-      FREQUENCY.fullTransform.hueStep = message.substring(3).toInt();
+      FREQUENCY.fullTransform.hueStep =
+          substrToInt(BLUETOOTH.message, 3, BLUETOOTH.messageSize);
       return 0;
     default:
       return 4;
   }
 }
-uint8_t strobeUpdate(String& message) {
-  auto setting = static_cast<Strobe::Setting>(message.substring(1, 3).toInt());
+uint8_t strobeUpdate(char* charArray) {
+  auto setting =
+      static_cast<Strobe::Setting>(substrToInt(BLUETOOTH.message, 1, 3));
   switch (setting) {
     case Strobe::COLOR: {
-      CHSV color = parseHsvColor(message.substring(3));
+      CHSV color = parseHsvColor(BLUETOOTH.message, 3, BLUETOOTH.messageSize);
       STROBE.hue = color.hue;
       STROBE.saturation = color.saturation;
       STROBE.maxBrighness = color.value;
-      Serial.print("STROBE.hue=");
-      Serial.println(STROBE.hue);
-      Serial.print("STROBE.saturation=");
-      Serial.println(STROBE.saturation);
-      Serial.print("STROBE.maxBrighness=");
-      Serial.println(STROBE.maxBrighness);
       return 0;
     }
     case Strobe::BRIGHTNESS_STEP:
-      STROBE.brightStep = message.substring(3).toInt();
-      Serial.print("STROBE.brightStep=");
-      Serial.println(STROBE.brightStep);
+      STROBE.brightStep =
+          substrToInt(BLUETOOTH.message, 3, BLUETOOTH.messageSize);
       return 0;
     case Strobe::DUTY:
-      STROBE.duty = message.substring(3).toInt();
-      Serial.print("STROBE.duty=");
-      Serial.println(STROBE.duty);
+      STROBE.duty = substrToInt(BLUETOOTH.message, 3, BLUETOOTH.messageSize);
       return 0;
     case Strobe::CYCLE_PERIOD:
-      STROBE.cyclePeriod = message.substring(3).toInt();
-      Serial.print("STROBE.cyclePeriod=");
-      Serial.println(STROBE.cyclePeriod);
+      STROBE.cyclePeriod =
+          substrToInt(BLUETOOTH.message, 3, BLUETOOTH.messageSize);
       return 0;
     default:
       return 5;
   }
 }
-uint8_t backlightUpdate(String& message) {
+uint8_t backlightUpdate(char* charArray) {
   auto setting =
-      static_cast<Backlight::Setting>(message.substring(1, 3).toInt());
+      static_cast<Backlight::Setting>(substrToInt(BLUETOOTH.message, 1, 3));
   switch (setting) {
     case Backlight::MODE:
-      BACKLIGHT.mode = message.substring(3).toInt();
-      Serial.print("BACKLIGHT.mode=");
-      Serial.println(BACKLIGHT.mode);
+      BACKLIGHT.mode = substrToInt(BLUETOOTH.message, 3, BLUETOOTH.messageSize);
       return 0;
     case Backlight::COLOR: {
-      BACKLIGHT.color = parseHsvColor(message.substring(3));
-      Serial.print("BACKLIGHT.COLOR=");
-      Serial.print(BACKLIGHT.color.h);
-      Serial.print(",");
-      Serial.print(BACKLIGHT.color.s);
-      Serial.print(",");
-      Serial.print(BACKLIGHT.color.v);
+      BACKLIGHT.color =
+          parseHsvColor(BLUETOOTH.message, 3, BLUETOOTH.messageSize);
+      BACKLIGHT.currentHue = BACKLIGHT.color.hue;
       return 0;
     }
     case Backlight::COLOR_CHANGE_DELAY:
-      BACKLIGHT.colorChangeDelay = message.substring(3).toInt();
-      Serial.print("BACKLIGHT.colorChangeDelay=");
-      Serial.println(BACKLIGHT.colorChangeDelay);
+      BACKLIGHT.colorChangeDelay =
+          substrToInt(BLUETOOTH.message, 3, BLUETOOTH.messageSize);
       return 0;
     case Backlight::RAINBOW_COLOR_STEP:
-      BACKLIGHT.rainbowColorStep = message.substring(3).toInt();
-      Serial.print("BACKLIGHT.rainbowColorStep=");
-      Serial.println(BACKLIGHT.rainbowColorStep);
+      BACKLIGHT.rainbowColorStep =
+          substrToInt(BLUETOOTH.message, 3, BLUETOOTH.messageSize);
       return 0;
     case Backlight::RAINBOW_STEP:
-      BACKLIGHT.rainbowStep = message.substring(3).toInt();
-      Serial.print("BACKLIGHT.rainbowStep=");
-      Serial.println(BACKLIGHT.rainbowStep);
+      BACKLIGHT.rainbowStep =
+          substrToInt(BLUETOOTH.message, 3, BLUETOOTH.messageSize);
       return 0;
     default:
       return 6;
   }
 }
-void bluetoothOperation(String& message) {
+void bluetoothOperation(char* charArray) {
   auto operation =
-      static_cast<Bluetooth::Operation>(message.substring(1, 3).toInt());
+      static_cast<Bluetooth::Operation>(substrToInt(BLUETOOTH.message, 1, 3));
   switch (operation) {
     case Bluetooth::GET_STATE:
       BLUETOOTH_SERIAL.write(BLUETOOTH.state);
@@ -801,12 +803,40 @@ void bluetoothOperation(String& message) {
   }
 }
 
-CHSV parseHsvColor(String message) {
-  int firstComma = message.indexOf(',');
-  int lastComma = message.lastIndexOf(',');
+CHSV parseHsvColor(char* charArray, uint8_t from, uint8_t to) {
+  uint8_t firstSemicolon;
+  uint8_t lastSemicolon;
+  for (uint8_t i = from; i < to; i++) {
+    if (charArray[i] == ';') {
+      firstSemicolon = i;
+      break;
+    }
+  }
+  for (uint8_t i = firstSemicolon + 1; i < to; i++) {
+    if (charArray[i] == ';') {
+      lastSemicolon = i;
+      break;
+    }
+  }
   CHSV color;
-  color.hue = message.substring(0, firstComma).toInt();
-  color.saturation = message.substring(firstComma + 1, lastComma).toInt();
-  color.value = message.substring(lastComma + 1).toInt();
+  color.hue = substrToInt(&(charArray[from]), 0, firstSemicolon);
+  color.saturation =
+      substrToInt(&(charArray[firstSemicolon]), 1, lastSemicolon);
+  color.value = substrToInt(&(charArray[lastSemicolon]), 1, to);
   return color;
+}
+
+int substrToInt(char* charArray, uint8_t from, uint8_t to) {
+  char symbol = charArray[to];
+  charArray[to] = '\0';
+  int res = atoi(&(charArray[from]));
+  charArray[to] = symbol;
+  return res;
+}
+double substrToDouble(char* charArray, uint8_t from, uint8_t to) {
+  char symbol = charArray[to];
+  charArray[to] = '\0';
+  double res = atof(&(charArray[from]));
+  charArray[to] = symbol;
+  return res;
 }

@@ -69,14 +69,14 @@ struct FrequencyAnalyzer {
   enum Setting {
     IS_FULL_TRANSFORM,
     LMH_MODE,
-    ONE_LINE_MODE,
-    RUNNING_MODE,
-    RUNNING_SPEED,
     LHM_LOW_HUE,
     LHM_MEDIUM_HUE,
     LHM_HIGH_HUE,
     LHM_SMOOTH,
     LHM_STEP,
+    ONE_LINE_MODE,
+    RUNNING_MODE,
+    RUNNING_SPEED,
     FULL_LOW_HUE,
     FULL_SMOOTH,
     FULL_HUE_STEP
@@ -95,11 +95,11 @@ struct FrequencyAnalyzer {
       uint8_t speed = 10;
       int8_t mode = 0;
       // NOT configurable
-      unsigned long runDelay;
+      unsigned long runDelay = 0;
     } runningFrequency;
 
     uint8_t colors[3] = {HUE_RED, HUE_GREEN, HUE_YELLOW};
-    float smooth = 0.8;
+    float smooth = 0.8; 
     uint8_t step = 20;
 
     // NOT configurable
@@ -110,8 +110,8 @@ struct FrequencyAnalyzer {
   } lmhTransform;
 
   struct FullTransform {
-    uint8_t lowFrequencyHue = HUE_RED;
-    uint8_t smooth = 2;
+    uint8_t lowFrequencyHue = HUE_RED; 
+    uint8_t smooth = 2;  
     uint8_t hueStep = 5;
 
     // NOT CONFIGURABLE
@@ -159,5 +159,5 @@ struct Backlight {
 
   // NOT CONFIGURABLE
   unsigned long colorChangeTime;
-  uint8_t currentColor;
+  uint8_t currentHue;
 };
