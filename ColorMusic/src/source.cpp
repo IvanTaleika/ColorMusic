@@ -22,7 +22,6 @@
   HUE_PURPLE
   HUE_PINK
 */
-
 // --------------------------- НАСТРОЙКИ ---------------------------
 // Serial.print("");
 // Serial.println();
@@ -31,6 +30,8 @@
 #include "source.h"
 #include <FHT.h>  // преобразование Хартли
 #include <SoftwareSerial.h>
+
+#define MAX_PACKAGE_AWAIT_TIME 4000
 // градиент-палитра от зелёного к красному
 DEFINE_GRADIENT_PALETTE(soundlevel_gp){
     0,   0,   255, 0,  // green
@@ -41,14 +42,18 @@ DEFINE_GRADIENT_PALETTE(soundlevel_gp){
 };
 SoftwareSerial BLUETOOTH_SERIAL(2, 3);  // arduino RX | TX
 CRGBPalette32 MY_PAL = soundlevel_gp;
+unsigned long PREVIOUS_PACKAGE_TIME;
 unsigned long LOOP_TIMER = 0;
-CRGB* STRIP_LEDS = nullptr;
+uint8_t MODE = 0;
+bool IS_STRIP_ON = false;
+CRGB* STRIP_LEDS;
 Global GLOBAL;
 VuAnalyzer VU;
 FrequencyAnalyzer FREQUENCY;
-Strobe STROBE;
+Strob STROB;
 Backlight BACKLIGHT;
-Bluetooth BLUETOOTH;
+LowMediumHighFrequency LHM_FREQUENCY;
+FullRangeFrequency FULL_FREQUENCY;
 
 void setup() {
   Serial.begin(9600);
@@ -66,7 +71,7 @@ void setup() {
   setThreshold();
 }
 void setReferenceVoltage() {
-  if (GLOBAL.isMicro) {
+  if (GLOBAL.settings.isMicro) {
     analogReference(DEFAULT);
   } else {
     analogReference(INTERNAL);
@@ -74,13 +79,13 @@ void setReferenceVoltage() {
 }
 void initLeds() {
   delete[] STRIP_LEDS;
-  STRIP_LEDS = new CRGB[GLOBAL.numLeds];
-  FastLED.addLeds<WS2811, LED_PIN, GRB>(STRIP_LEDS, GLOBAL.numLeds)
+  STRIP_LEDS = new CRGB[GLOBAL.settings.numLeds];
+  FastLED.addLeds<WS2811, LED_PIN, GRB>(STRIP_LEDS, GLOBAL.settings.numLeds)
       .setCorrection(TypicalLEDStrip);
-  FastLED.setBrightness(GLOBAL.enabledBrightness);
-  GLOBAL.halfLedsNum = GLOBAL.numLeds / 2;
-  VU.colorToLed = (float)255 / GLOBAL.halfLedsNum;
-  FREQUENCY.fullTransform.ledsForFreq = (float)GLOBAL.halfLedsNum / 30;
+  FastLED.setBrightness(GLOBAL.settings.enabledBrightness);
+  GLOBAL.halfLedsNum = GLOBAL.settings.numLeds / 2;
+  VU.colorToLed = 255. / GLOBAL.halfLedsNum;
+  FULL_FREQUENCY.ledsForFreq = GLOBAL.halfLedsNum / 30.;
 }
 
 void setThreshold() {
@@ -130,10 +135,10 @@ void setFrequencyThreshold() {
 
 void loop() {
   checkBluetooth();
-  if (GLOBAL.isOn && millis() - LOOP_TIMER > LOOP_DELAY) {
+  if (IS_STRIP_ON && millis() - LOOP_TIMER > LOOP_DELAY) {
     processSound();
     FastLED.show();
-    if (GLOBAL.currentMode != 7) {  // 7 режиму не нужна очистка!!!
+    if (MODE != 7) {    // 7 режиму не нужна очистка!!!
       FastLED.clear();  // очистить массив пикселей
     }
     LOOP_TIMER = millis();  // сбросить таймер
@@ -141,17 +146,20 @@ void loop() {
 }
 
 void processSound() {
-  switch (GLOBAL.currentMode) {
+  switch (MODE) {
     case 0:
       processLevel();
       return;
     case 1:
-      processFrequency();
+      lmhFrequencyTransform();
       return;
     case 2:
-      processStrobe();
+      fullFrequencyTransform();
       return;
     case 3:
+      processStrobe();
+      return;
+    case 4:
       backlightAnimation();
       return;
   }
@@ -166,7 +174,7 @@ void processLevel() {
     if (rMax < rLevel) {
       rMax = rLevel;
     }
-    if (GLOBAL.isStereo && !GLOBAL.isMicro) {
+    if (GLOBAL.settings.isStereo && !GLOBAL.settings.isMicro) {
       lLevel = analogRead(Global::WIRE_LEFT_PIN);
       if (lMax < lLevel) {
         lMax = lLevel;
@@ -178,11 +186,15 @@ void processLevel() {
   // Serial.print("lMax=");
   // Serial.println(lMax);
   // фильтр скользящее среднее
-  VU.rAverage = (float)rMax * VU.smooth + VU.rAverage * (1 - VU.smooth);
+  VU.rAverage =
+      (rMax * VU.settings.smooth + VU.rAverage * (10 - VU.settings.smooth)) /
+      10;
 
-  if (GLOBAL.isStereo && !GLOBAL.isMicro) {
+  if (GLOBAL.settings.isStereo && !GLOBAL.settings.isMicro) {
     lMax = calcSoundLevel(lMax);
-    VU.lAverage = (float)lMax * VU.smooth + VU.lAverage * (1 - VU.smooth);
+    VU.lAverage =
+        (lMax * VU.settings.smooth + VU.lAverage * (10 - VU.settings.smooth)) /
+        10;
   } else {
     VU.lAverage = VU.rAverage;
   }
@@ -197,27 +209,27 @@ void processLevel() {
     VU.maxLevel = VU.averageLevel * VU.maxMultiplier;
 
     // преобразуем сигнал в длину ленты
-    int16_t rLength = map(VU.rAverage, 0, VU.maxLevel, 0, GLOBAL.halfLedsNum);
-    int16_t lLength = map(VU.lAverage, 0, VU.maxLevel, 0, GLOBAL.halfLedsNum);
+    uint16_t rLength = map(VU.rAverage, 0, VU.maxLevel, 0, GLOBAL.halfLedsNum);
+    uint16_t lLength = map(VU.lAverage, 0, VU.maxLevel, 0, GLOBAL.halfLedsNum);
     // ограничиваем до макс. числа светодиодов
     rLength = constrain(rLength, 0, GLOBAL.halfLedsNum);
     lLength = constrain(lLength, 0, GLOBAL.halfLedsNum);
 
     vuAnimation(rLength, lLength);
-  } else if (GLOBAL.disabledBrightness > 0) {
+  } else if (GLOBAL.settings.disabledBrightness > 0) {
     silence();
   }
 }
 
-void vuAnimation(int16_t rLength, int16_t lLength) {
+void vuAnimation(uint16_t rLength, uint16_t lLength) {
   uint8_t count = 0;
-  int16_t halfLedsNum = GLOBAL.halfLedsNum;
+  uint16_t halfLedsNum = GLOBAL.halfLedsNum;
   float colorToLed = VU.colorToLed;
-  if (VU.isRainbowOn) {
+  if (VU.settings.isRainbowOn) {
     // заливка по палитре радуга
     if (millis() - VU.rainbowTimer > 30) {
       VU.rainbowTimer = millis();
-      VU.rainbowColor = VU.rainbowColor + VU.rainbowStep;
+      VU.rainbowColor = VU.rainbowColor + VU.settings.rainbowStep;
     }
     count = 0;
     // RainbowColors_p -  default FastLED pallet
@@ -242,79 +254,77 @@ void vuAnimation(int16_t rLength, int16_t lLength) {
       STRIP_LEDS[i] = ColorFromPalette(MY_PAL, (count * colorToLed));
     }
   }
-  if (GLOBAL.disabledBrightness > 0) {
+  if (GLOBAL.settings.disabledBrightness > 0) {
     colorEmptyLeds(halfLedsNum - rLength, halfLedsNum - lLength);
   }
 }
 
-void colorEmptyLeds(int16_t rDisabled, int16_t lDisabled) {
-  CHSV dark = CHSV(GLOBAL.disabledHue, 255, GLOBAL.disabledBrightness);
+void colorEmptyLeds(uint16_t rDisabled, uint16_t lDisabled) {
+  CHSV dark = CHSV(GLOBAL.settings.disabledHue, 255,
+                   GLOBAL.settings.disabledBrightness);
   if (rDisabled > 0) {
     fill_solid(STRIP_LEDS, rDisabled, dark);
   }
   if (lDisabled > 0) {
-    fill_solid(&(STRIP_LEDS[GLOBAL.numLeds - lDisabled]), lDisabled, dark);
+    fill_solid(&(STRIP_LEDS[GLOBAL.settings.numLeds - lDisabled]), lDisabled,
+               dark);
   }
 }
 
 void backlightAnimation() {
-  switch (BACKLIGHT.mode) {
+  switch (BACKLIGHT.settings.mode) {
     case 0:
-      fillLeds(BACKLIGHT.color);
+      fillLeds(BACKLIGHT.settings.color);
       break;
     case 1:
-      if (millis() - BACKLIGHT.colorChangeTime > BACKLIGHT.colorChangeDelay) {
+      if (millis() - BACKLIGHT.colorChangeTime >
+          BACKLIGHT.settings.colorChangeDelay) {
         BACKLIGHT.colorChangeTime = millis();
         BACKLIGHT.currentHue++;
       }
-      fillLeds(CHSV(BACKLIGHT.currentHue, BACKLIGHT.color.saturation,
-                    BACKLIGHT.color.val));
+      fillLeds(CHSV(BACKLIGHT.currentHue, BACKLIGHT.settings.color.s,
+                    BACKLIGHT.settings.color.v));
       break;
     case 2:
-      if (millis() - BACKLIGHT.colorChangeTime > BACKLIGHT.colorChangeDelay) {
+      if (millis() - BACKLIGHT.colorChangeTime >
+          BACKLIGHT.settings.colorChangeDelay) {
         BACKLIGHT.colorChangeTime = millis();
-        BACKLIGHT.currentHue += BACKLIGHT.rainbowColorStep;
+        BACKLIGHT.currentHue += BACKLIGHT.settings.rainbowColorStep;
       }
       uint8_t rainbowStep = BACKLIGHT.currentHue;
-      for (uint16_t i = 0; i < GLOBAL.numLeds; i++) {
-        STRIP_LEDS[i] =
-            CHSV(rainbowStep, BACKLIGHT.color.saturation, BACKLIGHT.color.val);
-        rainbowStep += BACKLIGHT.rainbowStep;
+      for (uint16_t i = 0; i < GLOBAL.settings.numLeds; i++) {
+        STRIP_LEDS[i] = CHSV(rainbowStep, BACKLIGHT.settings.color.s,
+                             BACKLIGHT.settings.color.v);
+        rainbowStep += BACKLIGHT.settings.rainbowStep;
       }
       break;
   }
 }
 void processStrobe() {
-  unsigned long delay = millis() - STROBE.previousFlashTime;
-  if (delay > STROBE.cyclePeriod) {
-    STROBE.previousFlashTime = millis();
-  } else if (delay > STROBE.cyclePeriod * STROBE.duty / 100) {
-    if (STROBE.brightness > STROBE.brightStep) {
-      STROBE.brightness -= STROBE.brightStep;
+  unsigned long delay = millis() - STROB.previousFlashTime;
+  if (delay > STROB.settings.flashPeriod) {
+    STROB.previousFlashTime = millis();
+  } else if (delay > STROB.settings.flashPeriod * STROB.settings.duty / 100) {
+    if (STROB.brightness > STROB.settings.brightStep) {
+      STROB.brightness -= STROB.settings.brightStep;
     } else {
-      STROBE.brightness = 0;
+      STROB.brightness = 0;
     }
-  } else if (STROBE.brightness < STROBE.maxBrighness - STROBE.brightStep) {
-    STROBE.brightness += STROBE.brightStep;
+  } else if (STROB.brightness <
+             STROB.settings.maxBrighness - STROB.settings.brightStep) {
+    STROB.brightness += STROB.settings.brightStep;
   } else {
-    STROBE.brightness = STROBE.maxBrighness;
+    STROB.brightness = STROB.settings.maxBrighness;
   }
   strobeAnimation();
 }
 void strobeAnimation() {
-  if (STROBE.brightness > 0) {
-    fillLeds(CHSV(STROBE.hue, STROBE.saturation, STROBE.brightness));
+  if (STROB.brightness > 0) {
+    fillLeds(
+        CHSV(STROB.settings.hue, STROB.settings.saturation, STROB.brightness));
   } else {
-    fillLeds(CHSV(GLOBAL.disabledHue, 255, GLOBAL.disabledBrightness));
-  }
-}
-
-void processFrequency() {
-  analyzeAudio();
-  if (FREQUENCY.isFullTransform) {
-    fullFrequencyTransform();
-  } else {
-    lmhTransform();
+    fillLeds(CHSV(GLOBAL.settings.disabledHue, 255,
+                  GLOBAL.settings.disabledBrightness));
   }
 }
 
@@ -331,7 +341,7 @@ void analyzeAudio() {
 
 void fullFrequencyTransform() {
   uint8_t freqMax = 0;
-  uint8_t* frequency = FREQUENCY.fullTransform.frequency;
+  uint8_t* frequency = FULL_FREQUENCY.frequency;
   for (uint8_t i = 0; i < 30; i++) {
     if (fht_log_out[i + 2] > freqMax) {
       freqMax = fht_log_out[i + 2];
@@ -342,35 +352,36 @@ void fullFrequencyTransform() {
 
     if (frequency[i] < fht_log_out[i + 2]) {
       frequency[i] = fht_log_out[i + 2];
-    } else if (frequency[i] > FREQUENCY.fullTransform.smooth) {
-      frequency[i] -= FREQUENCY.fullTransform.smooth;
+    } else if (frequency[i] > FULL_FREQUENCY.settings.smooth) {
+      frequency[i] -= FULL_FREQUENCY.settings.smooth;
     } else {
       frequency[i] = 0;
     }
   }
-  FREQUENCY.fullTransform.maxFrequency =
-      freqMax * averK + FREQUENCY.fullTransform.maxFrequency * (1 - averK);
+  FULL_FREQUENCY.maxFrequency =
+      freqMax * averK + FULL_FREQUENCY.maxFrequency * (1 - averK);
   fullFrequencyAnimation();
 }
 
 void fullFrequencyAnimation() {
-  uint8_t hue = FREQUENCY.fullTransform.lowFrequencyHue;
+  uint8_t hue = FULL_FREQUENCY.settings.lowFrequencyHue;
   uint8_t stripSize;
   uint8_t bright;
   uint16_t position = 0;
   for (uint8_t i = 0; i < 30; i++) {
-    stripSize = (float)i * FREQUENCY.fullTransform.ledsForFreq + 0.5;
-    bright = map(FREQUENCY.fullTransform.frequency[30 - 1 - i], 0,
-                 FREQUENCY.fullTransform.maxFrequency, 0, 255);
+    stripSize = (float)i * FULL_FREQUENCY.ledsForFreq + 0.5;
+    bright = map(FULL_FREQUENCY.frequency[30 - 1 - i], 0,
+                 FULL_FREQUENCY.maxFrequency, 0, 255);
     fill_solid(STRIP_LEDS + position, stripSize, CHSV(hue, 255, bright));
-    fill_solid(&(STRIP_LEDS[GLOBAL.numLeds - stripSize - position - 1]),
-               stripSize, CHSV(hue, 255, bright));
-    hue += FREQUENCY.fullTransform.hueStep;
+    fill_solid(
+        &(STRIP_LEDS[GLOBAL.settings.numLeds - stripSize - position - 1]),
+        stripSize, CHSV(hue, 255, bright));
+    hue += FULL_FREQUENCY.settings.hueStep;
     position += stripSize;
   }
 }
 
-void lmhTransform() {
+void lmhFrequencyTransform() {
   uint8_t frequency[3];
   frequency[0] = 0;
   frequency[1] = 0;
@@ -399,79 +410,78 @@ void lmhTransform() {
   }
 
   //Звук с одинаковыми частотами в итоге вырубит отображение вообще
-  float value;
+  uint8_t value;
   for (uint8_t i = 0; i < 3; i++) {
-    value = frequency[i] * FREQUENCY.lmhTransform.smooth +
-            FREQUENCY.lmhTransform.averageFrequency[i] *
-                (1 - FREQUENCY.lmhTransform.smooth);
-    if (value > FREQUENCY.lmhTransform.averageFrequency[i] *
-                    FREQUENCY.lmhTransform.flashMultiplier) {
-      FREQUENCY.lmhTransform.bright[i] = 255;
-      FREQUENCY.lmhTransform.isFlash[i] = true;
+    value = (frequency[i] * LHM_FREQUENCY.settings.smooth +
+             LHM_FREQUENCY.lastFrequency[i] *
+                 (10 - LHM_FREQUENCY.settings.smooth)) /
+            10;
+    if (value >
+        LHM_FREQUENCY.lastFrequency[i] * LHM_FREQUENCY.flashMultiplier) {
+      LHM_FREQUENCY.bright[i] = 255;
+      LHM_FREQUENCY.isFlash[i] = true;
     } else {
-      FREQUENCY.lmhTransform.isFlash[i] = false;
-      if (FREQUENCY.lmhTransform.bright[i] < FREQUENCY.lmhTransform.step ||
-          FREQUENCY.lmhTransform.bright[i] < GLOBAL.disabledBrightness) {
-        FREQUENCY.lmhTransform.bright[i] = GLOBAL.disabledBrightness;
+      LHM_FREQUENCY.isFlash[i] = false;
+      if (LHM_FREQUENCY.bright[i] < LHM_FREQUENCY.settings.step ||
+          LHM_FREQUENCY.bright[i] < GLOBAL.settings.disabledBrightness) {
+        LHM_FREQUENCY.bright[i] = GLOBAL.settings.disabledBrightness;
       } else {
-        FREQUENCY.lmhTransform.bright[i] -= FREQUENCY.lmhTransform.step;
+        LHM_FREQUENCY.bright[i] -= LHM_FREQUENCY.settings.step;
       }
     }
-    FREQUENCY.lmhTransform.averageFrequency[i] = value;
+    LHM_FREQUENCY.lastFrequency[i] = value;
   }
   lmhFrequencyAnimation();
 }
 
 void lmhFrequencyAnimation() {
-  switch (FREQUENCY.lmhTransform.mode) {
+  switch (LHM_FREQUENCY.settings.mode) {
     case 0: {
-      uint16_t stripLenght = GLOBAL.numLeds / 5;
-      fill_solid(STRIP_LEDS, stripLenght,
-                 CHSV(FREQUENCY.lmhTransform.colors[2], 255,
-                      FREQUENCY.lmhTransform.bright[2]));
-      fill_solid(STRIP_LEDS + stripLenght, stripLenght,
-                 CHSV(FREQUENCY.lmhTransform.colors[1], 255,
-                      FREQUENCY.lmhTransform.bright[1]));
-      fill_solid(STRIP_LEDS + 2 * stripLenght, stripLenght,
-                 CHSV(FREQUENCY.lmhTransform.colors[0], 255,
-                      FREQUENCY.lmhTransform.bright[0]));
-      fill_solid(STRIP_LEDS + 3 * stripLenght, stripLenght,
-                 CHSV(FREQUENCY.lmhTransform.colors[1], 255,
-                      FREQUENCY.lmhTransform.bright[1]));
-      fill_solid(STRIP_LEDS + 4 * stripLenght, stripLenght,
-                 CHSV(FREQUENCY.lmhTransform.colors[2], 255,
-                      FREQUENCY.lmhTransform.bright[2]));
+      uint16_t stripLenght = GLOBAL.settings.numLeds / 5;
+      fill_solid(
+          STRIP_LEDS, stripLenght,
+          CHSV(LHM_FREQUENCY.settings.colors[2], 255, LHM_FREQUENCY.bright[2]));
+      fill_solid(
+          STRIP_LEDS + stripLenght, stripLenght,
+          CHSV(LHM_FREQUENCY.settings.colors[1], 255, LHM_FREQUENCY.bright[1]));
+      fill_solid(
+          STRIP_LEDS + 2 * stripLenght, stripLenght,
+          CHSV(LHM_FREQUENCY.settings.colors[0], 255, LHM_FREQUENCY.bright[0]));
+      fill_solid(
+          STRIP_LEDS + 3 * stripLenght, stripLenght,
+          CHSV(LHM_FREQUENCY.settings.colors[1], 255, LHM_FREQUENCY.bright[1]));
+      fill_solid(
+          STRIP_LEDS + 4 * stripLenght, stripLenght,
+          CHSV(LHM_FREQUENCY.settings.colors[2], 255, LHM_FREQUENCY.bright[2]));
       break;
     }
     case 1: {
-      uint16_t stripLenght = GLOBAL.numLeds / 3;
+      uint16_t stripLenght = GLOBAL.settings.numLeds / 3;
       for (uint8_t i = 0; i < 3; i++) {
         fill_solid(STRIP_LEDS + i * stripLenght, stripLenght,
-                   CHSV(FREQUENCY.lmhTransform.colors[i], 255,
-                        FREQUENCY.lmhTransform.bright[i]));
+                   CHSV(LHM_FREQUENCY.settings.colors[i], 255,
+                        LHM_FREQUENCY.bright[i]));
       }
       break;
     }
     case 2:
-      if (FREQUENCY.lmhTransform.oneLine.mode == 3) {
-        if (FREQUENCY.lmhTransform.isFlash[2])
-          fillLeds(CHSV(FREQUENCY.lmhTransform.colors[2], 255,
-                        FREQUENCY.lmhTransform.bright[2]));
-        else if (FREQUENCY.lmhTransform.isFlash[1])
-          fillLeds(CHSV(FREQUENCY.lmhTransform.colors[1], 255,
-                        FREQUENCY.lmhTransform.bright[1]));
-        else if (FREQUENCY.lmhTransform.isFlash[0])
-          fillLeds(CHSV(FREQUENCY.lmhTransform.colors[0], 255,
-                        FREQUENCY.lmhTransform.bright[0]));
+      if (LHM_FREQUENCY.settings.oneLineMode == 3) {
+        if (LHM_FREQUENCY.isFlash[2])
+          fillLeds(CHSV(LHM_FREQUENCY.settings.colors[2], 255,
+                        LHM_FREQUENCY.bright[2]));
+        else if (LHM_FREQUENCY.isFlash[1])
+          fillLeds(CHSV(LHM_FREQUENCY.settings.colors[1], 255,
+                        LHM_FREQUENCY.bright[1]));
+        else if (LHM_FREQUENCY.isFlash[0])
+          fillLeds(CHSV(LHM_FREQUENCY.settings.colors[0], 255,
+                        LHM_FREQUENCY.bright[0]));
         else
           silence();
       } else {
-        if (FREQUENCY.lmhTransform.isFlash[FREQUENCY.lmhTransform.oneLine.mode])
-          fillLeds(CHSV(FREQUENCY.lmhTransform
-                            .colors[FREQUENCY.lmhTransform.oneLine.mode],
-                        255,
-                        FREQUENCY.lmhTransform
-                            .bright[FREQUENCY.lmhTransform.oneLine.mode]));
+        if (LHM_FREQUENCY.isFlash[LHM_FREQUENCY.settings.oneLineMode])
+          fillLeds(CHSV(
+              LHM_FREQUENCY.settings.colors[LHM_FREQUENCY.settings.oneLineMode],
+              255, LHM_FREQUENCY.bright[LHM_FREQUENCY.settings.oneLineMode]));
         else
           silence();
       }
@@ -479,51 +489,49 @@ void lmhFrequencyAnimation() {
     case 3:
       //Показывает обычно просто средние - т.к. цепляет их чаще, низки почти не
       //попадают
-      if (millis() - FREQUENCY.lmhTransform.runningFrequency.runDelay >
-          FREQUENCY.lmhTransform.runningFrequency.speed) {
-        Serial.println("runningFrequency");
-        Serial.print("isFlash[2]=");
-        Serial.println(FREQUENCY.lmhTransform.isFlash[2]);
-        Serial.print("isFlash[1]=");
-        Serial.println(FREQUENCY.lmhTransform.isFlash[1]);
-        Serial.print("isFlash[0]=");
-        Serial.println(FREQUENCY.lmhTransform.isFlash[0]);
+      if (millis() - LHM_FREQUENCY.runDelay > LHM_FREQUENCY.settings.speed) {
+        // Serial.println("runningFrequency");
+        // Serial.print("isFlash[2]=");
+        // Serial.println(LHM_FREQUENCY.isFlash[2]);
+        // Serial.print("isFlash[1]=");
+        // Serial.println(LHM_FREQUENCY.isFlash[1]);
+        // Serial.print("isFlash[0]=");
+        // Serial.println(LHM_FREQUENCY.isFlash[0]);
         for (uint16_t i = 0; i < GLOBAL.halfLedsNum - 1; i++) {
-          Serial.print(i);
-          Serial.print(" ");
+          // Serial.print(i);
+          // Serial.print(" ");
 
           STRIP_LEDS[i] = STRIP_LEDS[i + 1];
-          STRIP_LEDS[GLOBAL.numLeds - i - 1] = STRIP_LEDS[i];
+          STRIP_LEDS[GLOBAL.settings.numLeds - i - 1] = STRIP_LEDS[i];
         }
-        FREQUENCY.lmhTransform.runningFrequency.runDelay = millis();
-        if (FREQUENCY.lmhTransform.runningFrequency.mode == 3) {
-          if (FREQUENCY.lmhTransform.isFlash[2])
-            STRIP_LEDS[GLOBAL.halfLedsNum] =
-                CHSV(FREQUENCY.lmhTransform.colors[2], 255,
-                     FREQUENCY.lmhTransform.bright[2]);
-          else if (FREQUENCY.lmhTransform.isFlash[1])
-            STRIP_LEDS[GLOBAL.halfLedsNum] =
-                CHSV(FREQUENCY.lmhTransform.colors[1], 255,
-                     FREQUENCY.lmhTransform.bright[1]);
-          else if (FREQUENCY.lmhTransform.isFlash[0])
-            STRIP_LEDS[GLOBAL.halfLedsNum] =
-                CHSV(FREQUENCY.lmhTransform.colors[0], 255,
-                     FREQUENCY.lmhTransform.bright[0]);
+        LHM_FREQUENCY.runDelay = millis();
+        if (LHM_FREQUENCY.settings.runningFrequencyMode == 3) {
+          if (LHM_FREQUENCY.isFlash[2])
+            STRIP_LEDS[GLOBAL.halfLedsNum] = CHSV(
+                LHM_FREQUENCY.settings.colors[2], 255, LHM_FREQUENCY.bright[2]);
+          else if (LHM_FREQUENCY.isFlash[1])
+            STRIP_LEDS[GLOBAL.halfLedsNum] = CHSV(
+                LHM_FREQUENCY.settings.colors[1], 255, LHM_FREQUENCY.bright[1]);
+          else if (LHM_FREQUENCY.isFlash[0])
+            STRIP_LEDS[GLOBAL.halfLedsNum] = CHSV(
+                LHM_FREQUENCY.settings.colors[0], 255, LHM_FREQUENCY.bright[0]);
           else
             STRIP_LEDS[GLOBAL.halfLedsNum] =
-                CHSV(GLOBAL.disabledHue, 255, GLOBAL.disabledBrightness);
+                CHSV(GLOBAL.settings.disabledHue, 255,
+                     GLOBAL.settings.disabledBrightness);
         } else {
-          if (FREQUENCY.lmhTransform
-                  .isFlash[FREQUENCY.lmhTransform.oneLine.mode]) {
+          if (LHM_FREQUENCY
+                  .isFlash[LHM_FREQUENCY.settings.runningFrequencyMode]) {
             STRIP_LEDS[GLOBAL.halfLedsNum] =
-                CHSV(FREQUENCY.lmhTransform
-                         .colors[FREQUENCY.lmhTransform.oneLine.mode],
+                CHSV(LHM_FREQUENCY.settings
+                         .colors[LHM_FREQUENCY.settings.runningFrequencyMode],
                      255,
-                     FREQUENCY.lmhTransform
-                         .bright[FREQUENCY.lmhTransform.oneLine.mode]);
+                     LHM_FREQUENCY
+                         .bright[LHM_FREQUENCY.settings.runningFrequencyMode]);
           } else {
             STRIP_LEDS[GLOBAL.halfLedsNum] =
-                CHSV(GLOBAL.disabledHue, 255, GLOBAL.disabledBrightness);
+                CHSV(GLOBAL.settings.disabledHue, 255,
+                     GLOBAL.settings.disabledBrightness);
           }
         }
         STRIP_LEDS[GLOBAL.halfLedsNum - 1] = STRIP_LEDS[GLOBAL.halfLedsNum];
@@ -541,302 +549,232 @@ float calcSoundLevel(float level) {
 }
 
 void silence() {
-  fill_solid(STRIP_LEDS, GLOBAL.numLeds,
-             CHSV(GLOBAL.disabledHue, 255, GLOBAL.disabledBrightness));
+  fill_solid(STRIP_LEDS, GLOBAL.settings.numLeds,
+             CHSV(GLOBAL.settings.disabledHue, 255,
+                  GLOBAL.settings.disabledBrightness));
 }
 
-void fillLeds(CHSV color) { fill_solid(STRIP_LEDS, GLOBAL.numLeds, color); }
+void fillLeds(CHSV color) {
+  fill_solid(STRIP_LEDS, GLOBAL.settings.numLeds, color);
+}
 
 void checkBluetooth() {
   if (BLUETOOTH_SERIAL.available() > 0) {
-    char incomingByte = BLUETOOTH_SERIAL.read();
-    if (incomingByte == START_BYTE) {
-      BLUETOOTH.messageSize = 0;
-      while (incomingByte != END_BYTE) {
-        if (BLUETOOTH_SERIAL.available() > 0) {
-          incomingByte = BLUETOOTH_SERIAL.read();
-          if (incomingByte == END_BYTE) {
-            BLUETOOTH.message[BLUETOOTH.messageSize] = '\0';
-            processMessage();
-          } else {
-            BLUETOOTH.message[BLUETOOTH.messageSize++] = incomingByte;
-          }
+    int incomingByte = BLUETOOTH_SERIAL.read();
+    Serial.print("StartByte=");
+    Serial.println(incomingByte);
+    BLUETOOTH_SERIAL.write((uint8_t)0);
+    PREVIOUS_PACKAGE_TIME = millis();
+    int target;
+    do {
+      target = readTarget();
+      Serial.print("target main=");
+      Serial.println((int)target);
+      if (target < 0) {
+        return;
+      }
+    } while (target == 0);
+    uint8_t configSize = getSettingsSize(target);
+    uint8_t* data = (uint8_t*)malloc(configSize + 1);
+    uint8_t result;
+    do {
+      result = readData(data, configSize);
+      Serial.print("result=");
+      Serial.println((int)result);
+      if (result < 0) {
+        free(data);
+        return;
+      }
+    } while (result == 0);
+    setSettings(target, data, configSize);
+    free(data);
+  }
+}
+
+int readData(uint8_t* data, uint8_t configSize) {
+  uint8_t index = 0;
+  PREVIOUS_PACKAGE_TIME = millis();
+  while (index < configSize + 1) {
+    if (BLUETOOTH_SERIAL.available() > 0) {
+      data[index] = BLUETOOTH_SERIAL.read();
+      Serial.print("data[");
+      Serial.print((int)index);
+      Serial.print("]=");
+      Serial.println((int)data[index]);
+      index++;
+    }
+    if (millis() - PREVIOUS_PACKAGE_TIME > MAX_PACKAGE_AWAIT_TIME) {
+      return -1;
+    }
+  }
+  if (calculateHash(data, configSize) == data[configSize]) {
+    BLUETOOTH_SERIAL.write((uint8_t)0);
+    return 1;
+  } else {
+    BLUETOOTH_SERIAL.write((uint8_t)1);
+    return 0;
+  }
+}
+
+int readTarget() {
+  uint8_t target;
+  while (true) {
+    if (BLUETOOTH_SERIAL.available() > 0) {
+      target = BLUETOOTH_SERIAL.read();
+      Serial.print("target=");
+      Serial.println((int)target);
+      break;
+    }
+    if (millis() - PREVIOUS_PACKAGE_TIME > MAX_PACKAGE_AWAIT_TIME) {
+      return -1;
+    }
+  }
+  uint8_t target1;
+  while (true) {
+    if (BLUETOOTH_SERIAL.available() > 0) {
+      target1 = BLUETOOTH_SERIAL.read();
+      Serial.print("TARGET1=");
+      Serial.println((int)target1);
+      if (target == target1) {
+        BLUETOOTH_SERIAL.write((uint8_t)0);
+        return target;
+      } else {
+        BLUETOOTH_SERIAL.write((uint8_t)1);
+        return 0;
+      }
+    }
+    if (millis() - PREVIOUS_PACKAGE_TIME > MAX_PACKAGE_AWAIT_TIME) {
+      return -1;
+    }
+  }
+}
+
+uint8_t calculateHash(uint8_t* data, uint8_t size) {
+  uint32_t hash = 0;
+  for (uint8_t i = 0; i < size; i++) {
+    hash += data[i];
+  }
+  return hash % 256;
+}
+
+uint8_t getSettingsSize(int target) {
+  switch (target) {
+    case 1:
+      return sizeof(IS_STRIP_ON);
+    case 2:
+      return sizeof(MODE);
+    case 3:
+      return 1;
+    case 100:
+      return sizeof(Global::Settings);
+    case 101:
+      return sizeof(VuAnalyzer::Settings);
+    case 102:
+      return sizeof(LowMediumHighFrequency::Settings);
+    case 103:
+      return sizeof(FullRangeFrequency::Settings);
+    case 104:
+      return sizeof(Strob::Settings);
+    case 105:
+      return sizeof(Backlight::Settings);
+    default:
+      return 0;
+  }
+}
+
+void setSettings(int target, uint8_t* data, uint8_t size) {
+  switch (target) {
+    case 1:
+      if (IS_STRIP_ON != data[0]) {
+        IS_STRIP_ON = data[0];
+        if (IS_STRIP_ON == false) {
+          fillLeds(CHSV(0, 0, 0));
+          FastLED.show();
         }
       }
-    }
-  }
-}
-
-void processMessage() {
-  Serial.print("message=");
-  Serial.println(BLUETOOTH.message);
-  Serial.print("state=");
-  Serial.println(BLUETOOTH.state);
-  uint8_t destination = substrToInt(BLUETOOTH.message, 0, 1);
-  uint8_t result = 0;
-  switch (destination) {
-    case 0:
-      result = globalUpdate(BLUETOOTH.message);
-      break;
-    case 1:
-      result = vuUpdate(BLUETOOTH.message);
-      break;
+      return;
     case 2:
-      result = frequencyUpdate(BLUETOOTH.message);
-      break;
+      MODE = data[0];
+      return;
     case 3:
-      result = strobeUpdate(BLUETOOTH.message);
-      break;
-    case 4:
-      result = backlightUpdate(BLUETOOTH.message);
-      break;
-    case 9:
-      bluetoothOperation(BLUETOOTH.message);
-      break;
+      return setThreshold();
+    case 100:
+      return setGlobalSettings((Global::Settings*)data);
+    case 101:
+      return setVuSettings((VuAnalyzer::Settings*)data);
+    case 102:
+      return setLmhFrequencySettings((LowMediumHighFrequency::Settings*)data);
+    case 103:
+      return setFullRangeFrequencySettings((FullRangeFrequency::Settings*)data);
+    case 104:
+      return setStrobSettings((Strob::Settings*)data);
+    case 105:
+      return setBacklightSettings((Backlight::Settings*)data);
     default:
-      result = 1;
-      break;
-  }
-  if (result) {
-    BLUETOOTH.state = result;
-  }
-}
-
-uint8_t globalUpdate(char* charArray) {
-  auto setting =
-      static_cast<Global::Setting>(substrToInt(BLUETOOTH.message, 1, 3));
-  switch (setting) {
-    case Global::ON_OFF:
-      GLOBAL.isOn = substrToInt(BLUETOOTH.message, 3, BLUETOOTH.messageSize);
-      if (GLOBAL.isOn == false) {
-        fillLeds(CHSV(0, 0, 0));
-        FastLED.show();
-      }
-      return 0;
-    case Global::MICRO:
-      GLOBAL.isMicro = substrToInt(BLUETOOTH.message, 3, BLUETOOTH.messageSize);
-      if (GLOBAL.isMicro) {
-        GLOBAL.soundRightPin = Global::MICRO_RIGHT_PIN;
-        GLOBAL.soundFrequencyPin = Global::MICRO_FREQUENCY_PIN;
-      } else {
-        GLOBAL.soundRightPin = Global::WIRE_RIGHT_PIN;
-        GLOBAL.soundFrequencyPin = Global::WIRE_FREQUENCY_PIN;
-      }
-      setReferenceVoltage();
-      setThreshold();
-      return 0;
-    case Global::STEREO:
-      GLOBAL.isStereo =
-          substrToInt(BLUETOOTH.message, 3, BLUETOOTH.messageSize);
-      return 0;
-    case Global::MODE:
-      GLOBAL.currentMode =
-          substrToInt(BLUETOOTH.message, 3, BLUETOOTH.messageSize);
-      return 0;
-    case Global::N_LEDS:
-      fillLeds(CHSV(0, 0, 0));
-      FastLED.show();
-      GLOBAL.numLeds = substrToInt(BLUETOOTH.message, 3, BLUETOOTH.messageSize);
-      initLeds();
-      return 0;
-    case Global::ENABLED_BRIGHTNESS:
-      GLOBAL.enabledBrightness =
-          substrToInt(BLUETOOTH.message, 3, BLUETOOTH.messageSize);
-      FastLED.setBrightness(GLOBAL.enabledBrightness);
-      return 0;
-    case Global::DISABLED_COLOR: {
-      CHSV color = parseHsvColor(BLUETOOTH.message, 3, BLUETOOTH.messageSize);
-      GLOBAL.disabledHue = color.hue;
-      GLOBAL.disabledBrightness = color.val;
-      return 0;
-    }
-    case Global::UPDATE_THRESHOLD:
-      setThreshold();
-      return 0;
-    default:
-      return 2;
-  }
-}
-
-uint8_t vuUpdate(char* charArray) {
-  auto setting =
-      static_cast<VuAnalyzer::Setting>(substrToInt(BLUETOOTH.message, 1, 3));
-  switch (setting) {
-    case VuAnalyzer::SMOOTH:
-      VU.smooth = substrToDouble(BLUETOOTH.message, 3, BLUETOOTH.messageSize);
-      return 0;
-    case VuAnalyzer::IS_RAINBOW:
-      VU.isRainbowOn = substrToInt(BLUETOOTH.message, 3, BLUETOOTH.messageSize);
-      return 0;
-    case VuAnalyzer::RAINBOW_STEP:
-      VU.rainbowStep = substrToInt(BLUETOOTH.message, 3, BLUETOOTH.messageSize);
-      return 0;
-    default:
-      return 3;
-  }
-}
-uint8_t frequencyUpdate(char* charArray) {
-  auto setting = static_cast<FrequencyAnalyzer::Setting>(
-      substrToInt(BLUETOOTH.message, 1, 3));
-  switch (setting) {
-    case FrequencyAnalyzer::IS_FULL_TRANSFORM:
-      FREQUENCY.isFullTransform =
-          substrToInt(BLUETOOTH.message, 3, BLUETOOTH.messageSize);
-      return 0;
-    case FrequencyAnalyzer::LMH_MODE:
-      FREQUENCY.lmhTransform.mode =
-          substrToInt(BLUETOOTH.message, 3, BLUETOOTH.messageSize);
-      return 0;
-    case FrequencyAnalyzer::LHM_LOW_HUE:
-      FREQUENCY.lmhTransform.colors[0] =
-          substrToInt(BLUETOOTH.message, 3, BLUETOOTH.messageSize);
-      return 0;
-    case FrequencyAnalyzer::LHM_MEDIUM_HUE:
-      FREQUENCY.lmhTransform.colors[1] =
-          substrToInt(BLUETOOTH.message, 3, BLUETOOTH.messageSize);
-      return 0;
-    case FrequencyAnalyzer::LHM_HIGH_HUE:
-      FREQUENCY.lmhTransform.colors[2] =
-          substrToInt(BLUETOOTH.message, 3, BLUETOOTH.messageSize);
-      return 0;
-    case FrequencyAnalyzer::LHM_SMOOTH:
-      FREQUENCY.lmhTransform.smooth =
-          substrToDouble(BLUETOOTH.message, 3, BLUETOOTH.messageSize);
-      return 0;
-    case FrequencyAnalyzer::LHM_STEP:
-      FREQUENCY.lmhTransform.step =
-          substrToInt(BLUETOOTH.message, 3, BLUETOOTH.messageSize);
-      return 0;
-    case FrequencyAnalyzer::ONE_LINE_MODE:
-      FREQUENCY.lmhTransform.oneLine.mode =
-          substrToInt(BLUETOOTH.message, 3, BLUETOOTH.messageSize);
-      return 0;
-    case FrequencyAnalyzer::RUNNING_MODE:
-      FREQUENCY.lmhTransform.runningFrequency.mode =
-          substrToInt(BLUETOOTH.message, 3, BLUETOOTH.messageSize);
-      return 0;
-    case FrequencyAnalyzer::RUNNING_SPEED:
-      FREQUENCY.lmhTransform.runningFrequency.speed =
-          substrToInt(BLUETOOTH.message, 3, BLUETOOTH.messageSize);
-      return 0;
-    case FrequencyAnalyzer::FULL_LOW_HUE:
-      FREQUENCY.fullTransform.lowFrequencyHue =
-          parseHsvColor(BLUETOOTH.message, 3, BLUETOOTH.messageSize).hue;
-      return 0;
-    case FrequencyAnalyzer::FULL_SMOOTH:
-      FREQUENCY.fullTransform.smooth =
-          substrToInt(BLUETOOTH.message, 3, BLUETOOTH.messageSize);
-      return 0;
-    case FrequencyAnalyzer::FULL_HUE_STEP:
-      FREQUENCY.fullTransform.hueStep =
-          substrToInt(BLUETOOTH.message, 3, BLUETOOTH.messageSize);
-      return 0;
-    default:
-      return 4;
-  }
-}
-uint8_t strobeUpdate(char* charArray) {
-  auto setting =
-      static_cast<Strobe::Setting>(substrToInt(BLUETOOTH.message, 1, 3));
-  switch (setting) {
-    case Strobe::COLOR: {
-      CHSV color = parseHsvColor(BLUETOOTH.message, 3, BLUETOOTH.messageSize);
-      STROBE.hue = color.hue;
-      STROBE.saturation = color.saturation;
-      STROBE.maxBrighness = color.value;
-      return 0;
-    }
-    case Strobe::BRIGHTNESS_STEP:
-      STROBE.brightStep =
-          substrToInt(BLUETOOTH.message, 3, BLUETOOTH.messageSize);
-      return 0;
-    case Strobe::DUTY:
-      STROBE.duty = substrToInt(BLUETOOTH.message, 3, BLUETOOTH.messageSize);
-      return 0;
-    case Strobe::CYCLE_PERIOD:
-      STROBE.cyclePeriod =
-          substrToInt(BLUETOOTH.message, 3, BLUETOOTH.messageSize);
-      return 0;
-    default:
-      return 5;
-  }
-}
-uint8_t backlightUpdate(char* charArray) {
-  auto setting =
-      static_cast<Backlight::Setting>(substrToInt(BLUETOOTH.message, 1, 3));
-  switch (setting) {
-    case Backlight::MODE:
-      BACKLIGHT.mode = substrToInt(BLUETOOTH.message, 3, BLUETOOTH.messageSize);
-      return 0;
-    case Backlight::COLOR: {
-      BACKLIGHT.color =
-          parseHsvColor(BLUETOOTH.message, 3, BLUETOOTH.messageSize);
-      BACKLIGHT.currentHue = BACKLIGHT.color.hue;
-      return 0;
-    }
-    case Backlight::COLOR_CHANGE_DELAY:
-      BACKLIGHT.colorChangeDelay =
-          substrToInt(BLUETOOTH.message, 3, BLUETOOTH.messageSize);
-      return 0;
-    case Backlight::RAINBOW_COLOR_STEP:
-      BACKLIGHT.rainbowColorStep =
-          substrToInt(BLUETOOTH.message, 3, BLUETOOTH.messageSize);
-      return 0;
-    case Backlight::RAINBOW_STEP:
-      BACKLIGHT.rainbowStep =
-          substrToInt(BLUETOOTH.message, 3, BLUETOOTH.messageSize);
-      return 0;
-    default:
-      return 6;
-  }
-}
-void bluetoothOperation(char* charArray) {
-  auto operation =
-      static_cast<Bluetooth::Operation>(substrToInt(BLUETOOTH.message, 1, 3));
-  switch (operation) {
-    case Bluetooth::GET_STATE:
-      BLUETOOTH_SERIAL.write(BLUETOOTH.state);
-      return;
-    case Bluetooth::RESET_STATE:
-      BLUETOOTH.state = 0;
       return;
   }
 }
 
-CHSV parseHsvColor(char* charArray, uint8_t from, uint8_t to) {
-  uint8_t firstSemicolon;
-  uint8_t lastSemicolon;
-  for (uint8_t i = from; i < to; i++) {
-    if (charArray[i] == ';') {
-      firstSemicolon = i;
-      break;
+void setGlobalSettings(Global::Settings* settings) {
+  Serial.println("Apply global");
+  auto oldSettings = &GLOBAL.settings;
+  if (oldSettings->isMicro != settings->isMicro) {
+    oldSettings->isMicro = settings->isMicro;
+    if (oldSettings->isMicro) {
+      GLOBAL.soundRightPin = Global::MICRO_RIGHT_PIN;
+      GLOBAL.soundFrequencyPin = Global::MICRO_FREQUENCY_PIN;
+    } else {
+      GLOBAL.soundRightPin = Global::WIRE_RIGHT_PIN;
+      GLOBAL.soundFrequencyPin = Global::WIRE_FREQUENCY_PIN;
     }
+    setReferenceVoltage();
+    setThreshold();
   }
-  for (uint8_t i = firstSemicolon + 1; i < to; i++) {
-    if (charArray[i] == ';') {
-      lastSemicolon = i;
-      break;
-    }
+  if (oldSettings->numLeds != settings->numLeds) {
+    oldSettings->numLeds = settings->numLeds;
+    fillLeds(CHSV(0, 0, 0));
+    FastLED.show();
+    initLeds();
   }
-  CHSV color;
-  color.hue = substrToInt(&(charArray[from]), 0, firstSemicolon);
-  color.saturation =
-      substrToInt(&(charArray[firstSemicolon]), 1, lastSemicolon);
-  color.value = substrToInt(&(charArray[lastSemicolon]), 1, to);
-  return color;
+  oldSettings->isStereo = settings->isStereo;
+  oldSettings->enabledBrightness = settings->enabledBrightness;
+  oldSettings->disabledBrightness = settings->disabledBrightness;
+  oldSettings->disabledHue = settings->disabledHue;
 }
 
-int substrToInt(char* charArray, uint8_t from, uint8_t to) {
-  char symbol = charArray[to];
-  charArray[to] = '\0';
-  int res = atoi(&(charArray[from]));
-  charArray[to] = symbol;
-  return res;
+void setVuSettings(VuAnalyzer::Settings* settings) {
+  Serial.println("Apply Vu");
+  VU.settings.rainbowStep = settings->rainbowStep;
+  VU.settings.smooth = settings->smooth;
+  VU.settings.isRainbowOn = settings->isRainbowOn;
 }
-double substrToDouble(char* charArray, uint8_t from, uint8_t to) {
-  char symbol = charArray[to];
-  charArray[to] = '\0';
-  double res = atof(&(charArray[from]));
-  charArray[to] = symbol;
-  return res;
+
+void setLmhFrequencySettings(LowMediumHighFrequency::Settings* settings) {
+  Serial.println("Apply LMH Frequency");
+  auto* p = &LHM_FREQUENCY.settings;
+  for (uint8_t i; i < sizeof(LowMediumHighFrequency::Settings); i++) {
+    p[i] = settings[i];
+  }
+}
+
+void setFullRangeFrequencySettings(FullRangeFrequency::Settings* settings) {
+  Serial.println("Apply Full Frequency");
+  FULL_FREQUENCY.settings.lowFrequencyHue = settings->lowFrequencyHue;
+  FULL_FREQUENCY.settings.smooth = settings->smooth;
+  FULL_FREQUENCY.settings.hueStep = settings->hueStep;
+}
+
+void setStrobSettings(Strob::Settings* settings) {
+  Serial.println("Apply Strob");
+  auto* p = &STROB.settings;
+  for (uint8_t i; i < sizeof(Strob::Settings); i++) {
+    p[i] = settings[i];
+  }
+}
+void setBacklightSettings(Backlight::Settings* settings) {
+  Serial.println("Apply Backlight");
+  auto* p = &BACKLIGHT.settings;
+  for (uint8_t i; i < sizeof(Backlight::Settings); i++) {
+    p[i] = settings[i];
+  }
 }
