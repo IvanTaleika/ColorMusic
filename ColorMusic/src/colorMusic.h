@@ -2,7 +2,6 @@
 #define FASTLED_ALLOW_INTERRUPTS 1
 #include <FastLED.h>
 // пины
-#define MLED_PIN 13  // пин светодиода режимов
 #define LED_PIN 4    // пин DI светодиодной ленты
 
 #define averK 0.006
@@ -21,7 +20,7 @@ struct Global {
   struct Settings {
     bool isMicro = false;
     bool isStereo = false;  // false - only right channel
-    uint16_t numLeds = 100;
+    uint16_t numLeds = 120;
     uint8_t enabledBrightness = 200;
     uint8_t disabledHue = HUE_PURPLE;
     uint8_t disabledBrightness = 30;
@@ -60,13 +59,12 @@ struct LowMediumHighFrequency {
     uint8_t mode;
 
     uint8_t colors[3] = {HUE_RED, HUE_GREEN, HUE_YELLOW};
-    uint8_t smooth = 0.8;
+    uint8_t smooth = 8;
     uint8_t step = 20;
-
-    uint8_t speed = 10;
-    uint8_t runningFrequencyMode = 0;
-
     uint8_t oneLineMode;
+    uint8_t runningFrequencyMode = 0;
+    uint16_t speed = 10;
+
   } settings;
 
   // NOT configurable
@@ -117,7 +115,7 @@ struct Backlight {
     CHSV color = {150, 200, 255};
 
     // mode 2
-    uint8_t colorChangeDelay = 100;
+    uint16_t colorChangeDelay = 100;
 
     // mode 3
     uint8_t rainbowColorStep = 3;
